@@ -3,12 +3,18 @@ include CHANGES.rst
 include README.rst
 include CONTRIBUTORS.txt
 include Makefile
+include .mypy.ini
+include pytest.ini
+include .coveragerc.toml
+include .coveragerc-cython.toml
 graft aiohttp
 graft docs
 graft examples
+graft fuzzers
 graft tests
-recursive-include vendor *
-global-include aiohttp *.pyi
+graft tools
+graft requirements
+graft vendor
 global-exclude *.pyc
 global-exclude *.pyd
 global-exclude *.so
@@ -16,5 +22,6 @@ global-exclude *.lib
 global-exclude *.dll
 global-exclude *.a
 global-exclude *.obj
+global-exclude *.hash
 exclude aiohttp/*.html
 prune docs/_build

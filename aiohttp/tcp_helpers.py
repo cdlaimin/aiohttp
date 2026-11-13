@@ -3,7 +3,6 @@
 import asyncio
 import socket
 from contextlib import suppress
-from typing import Optional  # noqa
 
 __all__ = ("tcp_keepalive", "tcp_nodelay")
 
@@ -15,11 +14,10 @@ if hasattr(socket, "SO_KEEPALIVE"):
         if sock is not None:
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
 
-
 else:
 
-    def tcp_keepalive(transport: asyncio.Transport) -> None:  # pragma: no cover
-        pass
+    def tcp_keepalive(transport: asyncio.Transport) -> None:
+        """Noop when keepalive not supported."""
 
 
 def tcp_nodelay(transport: asyncio.Transport, value: bool) -> None:

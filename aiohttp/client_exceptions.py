@@ -1,10 +1,10 @@
 """HTTP related errors."""
 
 import asyncio
-from typing import TYPE_CHECKING, Any, Optional, Tuple, Union
+from collections.abc import Mapping
+from typing import TYPE_CHECKING
 
-from .http_parser import RawResponseMessage
-from .typedefs import LooseHeaders
+from .typedefs import StrOrURL
 
 try:
     import ssl
@@ -13,21 +13,25 @@ try:
 except ImportError:  # pragma: no cover
     ssl = SSLContext = None  # type: ignore[assignment]
 
-
-if TYPE_CHECKING:  # pragma: no cover
+if TYPE_CHECKING:
     from .client_reqrep import ClientResponse, ConnectionKey, Fingerprint, RequestInfo
+    from .http_parser import RawResponseMessage
 else:
-    RequestInfo = ClientResponse = ConnectionKey = None
+    RequestInfo = ClientResponse = ConnectionKey = RawResponseMessage = None
 
 __all__ = (
     "ClientError",
     "ClientConnectionError",
+    "ClientConnectionResetError",
     "ClientOSError",
     "ClientConnectorError",
     "ClientProxyConnectionError",
     "ClientSSLError",
+    "ClientConnectorDNSError",
     "ClientConnectorSSLError",
     "ClientConnectorCertificateError",
+    "ConnectionTimeoutError",
+    "SocketTimeoutError",
     "ServerConnectionError",
     "ServerTimeoutError",
     "ServerDisconnectedError",
@@ -37,7 +41,14 @@ __all__ = (
     "WSServerHandshakeError",
     "ContentTypeError",
     "ClientPayloadError",
+    "UploadAbortedError",
     "InvalidURL",
+    "InvalidUrlClientError",
+    "RedirectClientError",
+    "NonHttpUrlClientError",
+    "InvalidUrlRedirectClientError",
+    "NonHttpUrlRedirectClientError",
+    "WSMessageTypeError",
 )
 
 
@@ -46,19 +57,25 @@ class ClientError(Exception):
 
 
 class ClientResponseError(ClientError):
-    """Connection error during reading response.
+    """Base class for exceptions that occur after getting a response.
 
-    request_info: instance of RequestInfo
+    request_info: An instance of RequestInfo.
+    history: A sequence of responses, if redirects occurred.
+    status: HTTP status code.
+    message: Error message.
+    headers: Response headers.
     """
+
+    args: tuple[RequestInfo, tuple[ClientResponse, ...]]
 
     def __init__(
         self,
         request_info: RequestInfo,
-        history: Tuple[ClientResponse, ...],
+        history: tuple[ClientResponse, ...],
         *,
-        status: Optional[int] = None,
+        status: int | None = None,
         message: str = "",
-        headers: Optional[LooseHeaders] = None,
+        headers: Mapping[str, str] | None = None,
     ) -> None:
         self.request_info = request_info
         if status is not None:
@@ -71,11 +88,7 @@ class ClientResponseError(ClientError):
         self.args = (request_info, history)
 
     def __str__(self) -> str:
-        return "{}, message={!r}, url={!r}".format(
-            self.status,
-            self.message,
-            self.request_info.real_url,
-        )
+        return f"{self.status}, message={self.message!r}, url={str(self.request_info.real_url)!r}"
 
     def __repr__(self) -> str:
         args = f"{self.request_info!r}, {self.history!r}"
@@ -113,6 +126,10 @@ class ClientConnectionError(ClientError):
     """Base class for client socket errors."""
 
 
+class ClientConnectionResetError(ClientConnectionError, ConnectionResetError):
+    """ConnectionResetError"""
+
+
 class ClientOSError(ClientConnectionError, OSError):
     """OSError error."""
 
@@ -121,8 +138,10 @@ class ClientConnectorError(ClientOSError):
     """Client connector error.
 
     Raised in :class:`aiohttp.connector.TCPConnector` if
-        connection to proxy can not be established.
+        a connection can not be established.
     """
+
+    args: tuple[ConnectionKey, OSError]
 
     def __init__(self, connection_key: ConnectionKey, os_error: OSError) -> None:
         self._conn_key = connection_key
@@ -139,20 +158,28 @@ class ClientConnectorError(ClientOSError):
         return self._conn_key.host
 
     @property
-    def port(self) -> Optional[int]:
+    def port(self) -> int | None:
         return self._conn_key.port
 
     @property
-    def ssl(self) -> Union[SSLContext, None, bool, "Fingerprint"]:
+    def ssl(self) -> "SSLContext | bool | Fingerprint":
         return self._conn_key.ssl
 
     def __str__(self) -> str:
         return "Cannot connect to host {0.host}:{0.port} ssl:{1} [{2}]".format(
-            self, self.ssl if self.ssl is not None else "default", self.strerror
+            self, "default" if self.ssl is True else self.ssl, self.strerror
         )
 
     # OSError.__reduce__ does too much black magick
     __reduce__ = BaseException.__reduce__
+
+
+class ClientConnectorDNSError(ClientConnectorError):
+    """DNS resolution failed during client connection.
+
+    Raised in :class:`aiohttp.connector.TCPConnector` if
+        DNS resolution fails.
+    """
 
 
 class ClientProxyConnectionError(ClientConnectorError):
@@ -182,7 +209,7 @@ class UnixClientConnectorError(ClientConnectorError):
 
     def __str__(self) -> str:
         return "Cannot connect to unix socket {0.path} ssl:{1} [{2}]".format(
-            self, self.ssl if self.ssl is not None else "default", self.strerror
+            self, "default" if self.ssl is True else self.ssl, self.strerror
         )
 
 
@@ -193,7 +220,9 @@ class ServerConnectionError(ClientConnectionError):
 class ServerDisconnectedError(ServerConnectionError):
     """Server disconnected."""
 
-    def __init__(self, message: Union[RawResponseMessage, str, None] = None) -> None:
+    args: tuple[RawResponseMessage | str]
+
+    def __init__(self, message: RawResponseMessage | str | None = None) -> None:
         if message is None:
             message = "Server disconnected"
 
@@ -205,8 +234,18 @@ class ServerTimeoutError(ServerConnectionError, asyncio.TimeoutError):
     """Server timeout error."""
 
 
+class ConnectionTimeoutError(ServerTimeoutError):
+    """Connection timeout error."""
+
+
+class SocketTimeoutError(ServerTimeoutError):
+    """Socket timeout error."""
+
+
 class ServerFingerprintMismatch(ServerConnectionError):
     """SSL certificate does not match expected fingerprint."""
+
+    args: tuple[bytes, bytes, str, int]
 
     def __init__(self, expected: bytes, got: bytes, host: str, port: int) -> None:
         self.expected = expected
@@ -216,13 +255,15 @@ class ServerFingerprintMismatch(ServerConnectionError):
         self.args = (expected, got, host, port)
 
     def __repr__(self) -> str:
-        return "<{} expected={!r} got={!r} host={!r} port={!r}>".format(
-            self.__class__.__name__, self.expected, self.got, self.host, self.port
-        )
+        return f"<{self.__class__.__name__} expected={self.expected!r} got={self.got!r} host={self.host!r} port={self.port!r}>"
 
 
 class ClientPayloadError(ClientError):
     """Response payload error."""
+
+
+class UploadAbortedError(ClientError):
+    """The request body was never fully sent."""
 
 
 class InvalidURL(ClientError, ValueError):
@@ -234,17 +275,54 @@ class InvalidURL(ClientError, ValueError):
 
     # Derive from ValueError for backward compatibility
 
-    def __init__(self, url: Any) -> None:
+    args: tuple[StrOrURL] | tuple[StrOrURL, str]
+
+    def __init__(self, url: StrOrURL, description: str | None = None) -> None:
         # The type of url is not yarl.URL because the exception can be raised
         # on URL(url) call
-        super().__init__(url)
+        self._url = url
+        self._description = description
+
+        if description:
+            super().__init__(url, description)
+        else:
+            super().__init__(url)
 
     @property
-    def url(self) -> Any:
-        return self.args[0]
+    def url(self) -> StrOrURL:
+        return self._url
+
+    @property
+    def description(self) -> "str | None":
+        return self._description
 
     def __repr__(self) -> str:
-        return f"<{self.__class__.__name__} {self.url}>"
+        return f"<{self.__class__.__name__} {self}>"
+
+    def __str__(self) -> str:
+        if self._description:
+            return f"{self._url} - {self._description}"
+        return str(self._url)
+
+
+class InvalidUrlClientError(InvalidURL):
+    """Invalid URL client error."""
+
+
+class RedirectClientError(ClientError):
+    """Client redirect error."""
+
+
+class NonHttpUrlClientError(ClientError):
+    """Non http URL client error."""
+
+
+class InvalidUrlRedirectClientError(InvalidUrlClientError, RedirectClientError):
+    """Invalid URL redirect client error."""
+
+
+class NonHttpUrlRedirectClientError(NonHttpUrlClientError, RedirectClientError):
+    """Non http URL redirect client error."""
 
 
 class ClientSSLError(ClientConnectorError):
@@ -261,7 +339,7 @@ if ssl is not None:
     ssl_errors = (ssl.SSLError,)
     ssl_error_bases = (ClientSSLError, ssl.SSLError)
 else:  # pragma: no cover
-    cert_errors = tuple()
+    cert_errors = tuple()  # type: ignore[unreachable]
     cert_errors_bases = (
         ClientSSLError,
         ValueError,
@@ -278,10 +356,22 @@ class ClientConnectorSSLError(*ssl_error_bases):  # type: ignore[misc]
 class ClientConnectorCertificateError(*cert_errors_bases):  # type: ignore[misc]
     """Response certificate error."""
 
+    _conn_key: ConnectionKey
+    args: tuple[ConnectionKey, Exception]
+
     def __init__(
-        self, connection_key: ConnectionKey, certificate_error: Exception
+        # TODO: If we require ssl in future, this can become ssl.CertificateError
+        self,
+        connection_key: ConnectionKey,
+        certificate_error: Exception,
     ) -> None:
-        self._conn_key = connection_key
+        if isinstance(certificate_error, cert_errors + (OSError,)):
+            # ssl.CertificateError has errno and strerror, so we should be fine
+            os_error = certificate_error
+        else:
+            os_error = OSError()
+
+        super().__init__(connection_key, os_error)
         self._certificate_error = certificate_error
         self.args = (connection_key, certificate_error)
 
@@ -294,16 +384,17 @@ class ClientConnectorCertificateError(*cert_errors_bases):  # type: ignore[misc]
         return self._conn_key.host
 
     @property
-    def port(self) -> Optional[int]:
+    def port(self) -> int | None:
         return self._conn_key.port
-
-    @property
-    def ssl(self) -> bool:
-        return self._conn_key.is_ssl
 
     def __str__(self) -> str:
         return (
-            "Cannot connect to host {0.host}:{0.port} ssl:{0.ssl} "
-            "[{0.certificate_error.__class__.__name__}: "
-            "{0.certificate_error.args}]".format(self)
+            f"Cannot connect to host {self.host}:{self.port} "
+            f"ssl:{'default' if self.ssl is True else self.ssl} "
+            f"[{self.certificate_error.__class__.__name__}: "
+            f"{self.certificate_error.args}]"
         )
+
+
+class WSMessageTypeError(TypeError):
+    """WebSocket message type is not valid."""

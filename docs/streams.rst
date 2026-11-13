@@ -12,6 +12,7 @@ Streaming API
 
 
 .. class:: StreamReader
+   :canonical: aiohttp.streams.StreamReader
 
    The reader from incoming stream.
 
@@ -20,22 +21,28 @@ Streaming API
    :attr:`aiohttp.ClientResponse.content` properties for accessing raw
    BODY data.
 
-Reading Methods
----------------
+Reading Attributes and Methods
+------------------------------
 
-.. comethod:: StreamReader.read(n=-1)
+.. method:: StreamReader.read(n=-1)
+      :async:
 
-   Read up to *n* bytes. If *n* is not provided, or set to ``-1``, read until
-   EOF and return all read bytes.
+   Read up to a maximum of *n* bytes. If *n* is not provided, or set to ``-1``,
+   read until EOF and return all read bytes.
+
+   When *n* is provided, data will be returned as soon as it is available.
+   Therefore it will return less than *n* bytes if there are less than *n*
+   bytes in the buffer.
 
    If the EOF was received and the internal buffer is empty, return an
    empty bytes object.
 
-   :param int n: how many bytes to read, ``-1`` for the whole stream.
+   :param int n: maximum number of bytes to read, ``-1`` for the whole stream.
 
    :return bytes: the given data
 
-.. comethod:: StreamReader.readany()
+.. method:: StreamReader.readany()
+      :async:
 
    Read next data portion for the stream.
 
@@ -43,7 +50,8 @@ Reading Methods
 
    :return bytes: the given data
 
-.. comethod:: StreamReader.readexactly(n)
+.. method:: StreamReader.readexactly(n)
+      :async:
 
    Read exactly *n* bytes.
 
@@ -57,7 +65,8 @@ Reading Methods
    :return bytes: the given data
 
 
-.. comethod:: StreamReader.readline()
+.. method:: StreamReader.readline()
+      :async:
 
    Read one line, where “line” is a sequence of bytes ending
    with ``\n``.
@@ -70,7 +79,8 @@ Reading Methods
 
    :return bytes: the given line
 
-.. comethod:: StreamReader.readuntil(separator="\n")
+.. method:: StreamReader.readuntil(separator=b"\n", *, max_size=None)
+      :async:
 
    Read until separator, where `separator` is a sequence of bytes.
 
@@ -82,9 +92,14 @@ Reading Methods
 
    .. versionadded:: 3.8
 
+   :param int max_size: maximum number of bytes to buffer while searching for
+      *separator*; exceeding it raises ``LineTooLong``. ``None``, the default,
+      uses the stream's high-water limit.
+
    :return bytes: the given data
 
-.. comethod:: StreamReader.readchunk()
+.. method:: StreamReader.readchunk()
+      :async:
 
    Read a chunk of data as it was received by the server.
 
@@ -97,6 +112,13 @@ Reading Methods
    :return tuple[bytes, bool]: a chunk of data and a :class:`bool` that is ``True``
                                when the end of the returned chunk corresponds
                                to the end of a HTTP chunk.
+
+
+.. attribute:: StreamReader.total_raw_bytes
+
+   The number of bytes of raw data downloaded (before decompression).
+
+   Readonly :class:`int` property.
 
 
 Asynchronous Iteration Support
@@ -113,24 +135,32 @@ By default it iterates over lines::
 Also there are methods for iterating over data chunks with maximum
 size limit and over any available data.
 
-.. comethod:: StreamReader.iter_chunked(n)
-   :async-for:
+.. method:: StreamReader.iter_chunked(n)
+   :async:
 
    Iterates over data chunks with maximum size limit::
 
       async for data in response.content.iter_chunked(1024):
           print(data)
 
-.. comethod:: StreamReader.iter_any()
-   :async-for:
+   To get chunks that are exactly *n* bytes, you could use the
+   `asyncstdlib.itertools <https://asyncstdlib.readthedocs.io/en/stable/source/api/itertools.html>`_
+   module::
+
+      chunks = batched(chain.from_iterable(response.content.iter_chunked(n)), n)
+      async for data in chunks:
+          print(data)
+
+.. method:: StreamReader.iter_any()
+   :async:
 
    Iterates over data chunks in order of intaking them into the stream::
 
       async for data in response.content.iter_any():
           print(data)
 
-.. comethod:: StreamReader.iter_chunks()
-   :async-for:
+.. method:: StreamReader.iter_chunks()
+   :async:
 
    Iterates over data chunks as received from the server::
 
@@ -164,13 +194,13 @@ Helpers
 
    .. seealso::
 
-      :meth:`StreamReader.at_eof()`
+      :meth:`StreamReader.at_eof`
 
 .. method:: StreamReader.at_eof()
 
    Return ``True`` if the buffer is empty and EOF was reached.
 
-.. method:: StreamReader.read_nowait(n=None)
+.. method:: StreamReader.read_nowait(n=-1)
 
    Returns data from internal buffer if any, empty bytes object otherwise.
 
@@ -190,9 +220,10 @@ Helpers
 
    .. warning:: The method does not wake up waiters.
 
-      E.g. :meth:`~StreamReader.read()` will not be resumed.
+      E.g. :meth:`~StreamReader.read` will not be resumed.
 
 
-.. comethod:: wait_eof()
+.. method:: wait_eof()
+      :async:
 
    Wait for EOF. The given data may be accessible by upcoming read calls.

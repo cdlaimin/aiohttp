@@ -2,23 +2,68 @@ import asyncio
 import signal
 import socket
 from abc import ABC, abstractmethod
-from typing import Any, List, Optional, Set, Type
+from collections.abc import Callable
+from typing import Any, Generic, TypeVar, Unpack
 
 from yarl import URL
 
 from .abc import AbstractAccessLogger, AbstractStreamWriter
 from .http_parser import RawRequestMessage
 from .streams import StreamReader
+from .typedefs import PathLike
 from .web_app import Application
+from .web_exceptions import HTTPBadRequest
 from .web_log import AccessLogger
 from .web_protocol import RequestHandler
-from .web_request import Request
-from .web_server import Server
+from .web_request import BaseRequest, Request
+from .web_server import Server, _ServerKwargs, _ServerOptions
 
 try:
     from ssl import SSLContext
-except ImportError:
+except ImportError:  # pragma: no cover
     SSLContext = object  # type: ignore[misc,assignment]
+
+try:
+    import aiofastnet
+except ImportError:
+    aiofastnet = None  # type: ignore[assignment]
+
+
+async def create_server(
+    loop: asyncio.AbstractEventLoop,
+    protocol_factory: Callable[[], asyncio.Protocol],
+    host: str | None = None,
+    port: int | None = None,
+    *,
+    sock: socket.socket | None = None,
+    ssl: SSLContext | None = None,
+    backlog: int = 100,
+    reuse_address: bool | None = None,
+    reuse_port: bool | None = None,
+) -> asyncio.Server:
+    if aiofastnet is not None:
+        return await aiofastnet.create_server(
+            loop,
+            protocol_factory,
+            host,
+            port,
+            sock=sock,
+            ssl=ssl,
+            backlog=backlog,
+            reuse_address=reuse_address,
+            reuse_port=reuse_port,
+        )
+    else:
+        return await loop.create_server(  # type: ignore[unreachable]
+            protocol_factory,
+            host,
+            port,
+            sock=sock,
+            ssl=ssl,
+            backlog=backlog,
+            reuse_address=reuse_address,
+            reuse_port=reuse_port,
+        )
 
 
 __all__ = (
@@ -33,6 +78,8 @@ __all__ = (
     "GracefulExit",
 )
 
+_Request = TypeVar("_Request", bound=BaseRequest)
+
 
 class GracefulExit(SystemExit):
     code = 1
@@ -43,28 +90,26 @@ def _raise_graceful_exit() -> None:
 
 
 class BaseSite(ABC):
-    __slots__ = ("_runner", "_shutdown_timeout", "_ssl_context", "_backlog", "_server")
+    __slots__ = ("_runner", "_ssl_context", "_backlog", "_server")
 
     def __init__(
         self,
-        runner: "BaseRunner",
+        runner: "BaseRunner[Any]",
         *,
-        shutdown_timeout: float = 60.0,
-        ssl_context: Optional[SSLContext] = None,
+        ssl_context: SSLContext | None = None,
         backlog: int = 128,
     ) -> None:
         if runner.server is None:
             raise RuntimeError("Call runner.setup() before making a site")
         self._runner = runner
-        self._shutdown_timeout = shutdown_timeout
         self._ssl_context = ssl_context
         self._backlog = backlog
-        self._server = None  # type: Optional[asyncio.AbstractServer]
+        self._server: asyncio.Server | None = None
 
     @property
     @abstractmethod
     def name(self) -> str:
-        pass  # pragma: no cover
+        """Return the name of the site (e.g. a URL)."""
 
     @abstractmethod
     async def start(self) -> None:
@@ -72,37 +117,28 @@ class BaseSite(ABC):
 
     async def stop(self) -> None:
         self._runner._check_site(self)
-        if self._server is None:
-            self._runner._unreg_site(self)
-            return  # not started yet
-        self._server.close()
-        # named pipes do not have wait_closed property
-        if hasattr(self._server, "wait_closed"):
-            await self._server.wait_closed()
-        await self._runner.shutdown()
-        assert self._runner.server
-        await self._runner.server.shutdown(self._shutdown_timeout)
+        if self._server is not None:  # Maybe not started yet
+            self._server.close()
+
         self._runner._unreg_site(self)
 
 
 class TCPSite(BaseSite):
-    __slots__ = ("_host", "_port", "_reuse_address", "_reuse_port")
+    __slots__ = ("_host", "_port", "_bound_port", "_reuse_address", "_reuse_port")
 
     def __init__(
         self,
-        runner: "BaseRunner",
-        host: Optional[str] = None,
-        port: Optional[int] = None,
+        runner: "BaseRunner[Any]",
+        host: str | None = None,
+        port: int | None = None,
         *,
-        shutdown_timeout: float = 60.0,
-        ssl_context: Optional[SSLContext] = None,
+        ssl_context: SSLContext | None = None,
         backlog: int = 128,
-        reuse_address: Optional[bool] = None,
-        reuse_port: Optional[bool] = None,
+        reuse_address: bool | None = None,
+        reuse_port: bool | None = None,
     ) -> None:
         super().__init__(
             runner,
-            shutdown_timeout=shutdown_timeout,
             ssl_context=ssl_context,
             backlog=backlog,
         )
@@ -110,21 +146,37 @@ class TCPSite(BaseSite):
         if port is None:
             port = 8443 if self._ssl_context else 8080
         self._port = port
+        self._bound_port: int | None = None
         self._reuse_address = reuse_address
         self._reuse_port = reuse_port
 
     @property
+    def port(self) -> int:
+        """The port the server is listening on.
+
+        If the server hasn't been started yet, this returns the requested port
+        (which might be 0 for a dynamic port).
+        After the server starts, it returns the actual bound port. This is
+        especially useful when port=0 was requested, as it allows retrieving the
+        dynamically assigned port after the site has started.
+        """
+        if self._bound_port is not None:
+            return self._bound_port
+        return self._port
+
+    @property
     def name(self) -> str:
         scheme = "https" if self._ssl_context else "http"
-        host = "0.0.0.0" if self._host is None else self._host
-        return str(URL.build(scheme=scheme, host=host, port=self._port))
+        host = "0.0.0.0" if not self._host else self._host
+        return str(URL.build(scheme=scheme, host=host, port=self.port))
 
     async def start(self) -> None:
         await super().start()
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         server = self._runner.server
         assert server is not None
-        self._server = await loop.create_server(
+        self._server = await create_server(
+            loop,
             server,
             self._host,
             self._port,
@@ -133,6 +185,10 @@ class TCPSite(BaseSite):
             reuse_address=self._reuse_address,
             reuse_port=self._reuse_port,
         )
+        if self._server.sockets:
+            self._bound_port = self._server.sockets[0].getsockname()[1]
+        else:
+            self._bound_port = self._port
 
 
 class UnixSite(BaseSite):
@@ -140,16 +196,14 @@ class UnixSite(BaseSite):
 
     def __init__(
         self,
-        runner: "BaseRunner",
-        path: str,
+        runner: "BaseRunner[Any]",
+        path: PathLike,
         *,
-        shutdown_timeout: float = 60.0,
-        ssl_context: Optional[SSLContext] = None,
+        ssl_context: SSLContext | None = None,
         backlog: int = 128,
     ) -> None:
         super().__init__(
             runner,
-            shutdown_timeout=shutdown_timeout,
             ssl_context=ssl_context,
             backlog=backlog,
         )
@@ -162,28 +216,29 @@ class UnixSite(BaseSite):
 
     async def start(self) -> None:
         await super().start()
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         server = self._runner.server
         assert server is not None
         self._server = await loop.create_unix_server(
-            server, self._path, ssl=self._ssl_context, backlog=self._backlog
+            server,
+            self._path,
+            ssl=self._ssl_context,
+            backlog=self._backlog,
         )
 
 
 class NamedPipeSite(BaseSite):
     __slots__ = ("_path",)
 
-    def __init__(
-        self, runner: "BaseRunner", path: str, *, shutdown_timeout: float = 60.0
-    ) -> None:
-        loop = asyncio.get_event_loop()
+    def __init__(self, runner: "BaseRunner[Any]", path: str) -> None:
+        loop = asyncio.get_running_loop()
         if not isinstance(
             loop, asyncio.ProactorEventLoop  # type: ignore[attr-defined]
         ):
             raise RuntimeError(
-                "Named Pipes only available in proactor" "loop under windows"
+                "Named Pipes only available in proactor loop under windows"
             )
-        super().__init__(runner, shutdown_timeout=shutdown_timeout)
+        super().__init__(runner)
         self._path = path
 
     @property
@@ -192,7 +247,7 @@ class NamedPipeSite(BaseSite):
 
     async def start(self) -> None:
         await super().start()
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         server = self._runner.server
         assert server is not None
         _server = await loop.start_serving_pipe(  # type: ignore[attr-defined]
@@ -206,16 +261,14 @@ class SockSite(BaseSite):
 
     def __init__(
         self,
-        runner: "BaseRunner",
+        runner: "BaseRunner[Any]",
         sock: socket.socket,
         *,
-        shutdown_timeout: float = 60.0,
-        ssl_context: Optional[SSLContext] = None,
+        ssl_context: SSLContext | None = None,
         backlog: int = 128,
     ) -> None:
         super().__init__(
             runner,
-            shutdown_timeout=shutdown_timeout,
             ssl_context=ssl_context,
             backlog=backlog,
         )
@@ -234,30 +287,50 @@ class SockSite(BaseSite):
 
     async def start(self) -> None:
         await super().start()
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         server = self._runner.server
         assert server is not None
-        self._server = await loop.create_server(
-            server, sock=self._sock, ssl=self._ssl_context, backlog=self._backlog
+        self._server = await create_server(
+            loop, server, sock=self._sock, ssl=self._ssl_context, backlog=self._backlog
         )
 
 
-class BaseRunner(ABC):
-    __slots__ = ("_handle_signals", "_kwargs", "_server", "_sites")
+class _RunnerKwargs(_ServerOptions, total=False):
+    shutdown_timeout: float
 
-    def __init__(self, *, handle_signals: bool = False, **kwargs: Any) -> None:
+
+class _AppRunnerKwargs(_RunnerKwargs, total=False):
+    handle_signals: bool
+    access_log_class: type[AbstractAccessLogger]
+
+
+class _ServerRunnerKwargs(_ServerKwargs, total=False):
+    shutdown_timeout: float
+
+
+class BaseRunner(ABC, Generic[_Request]):
+    __slots__ = ("_handle_signals", "_kwargs", "_server", "_sites", "_shutdown_timeout")
+
+    def __init__(
+        self,
+        *,
+        handle_signals: bool = False,
+        shutdown_timeout: float = 60.0,
+        **kwargs: Unpack[_ServerKwargs],
+    ) -> None:
         self._handle_signals = handle_signals
         self._kwargs = kwargs
-        self._server = None  # type: Optional[Server]
-        self._sites = []  # type: List[BaseSite]
+        self._server: Server[_Request] | None = None
+        self._sites: list[BaseSite] = []
+        self._shutdown_timeout = shutdown_timeout
 
     @property
-    def server(self) -> Optional[Server]:
+    def server(self) -> Server[_Request] | None:
         return self._server
 
     @property
-    def addresses(self) -> List[Any]:
-        ret = []  # type: List[Any]
+    def addresses(self) -> list[Any]:
+        ret: list[Any] = []
         for site in self._sites:
             server = site._server
             if server is not None:
@@ -268,17 +341,17 @@ class BaseRunner(ABC):
         return ret
 
     @property
-    def sites(self) -> Set[BaseSite]:
+    def sites(self) -> set[BaseSite]:
         return set(self._sites)
 
     async def setup(self) -> None:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
 
         if self._handle_signals:
             try:
                 loop.add_signal_handler(signal.SIGINT, _raise_graceful_exit)
                 loop.add_signal_handler(signal.SIGTERM, _raise_graceful_exit)
-            except NotImplementedError:  # pragma: no cover
+            except NotImplementedError:
                 # add_signal_handler is not implemented on Windows
                 pass
 
@@ -286,34 +359,42 @@ class BaseRunner(ABC):
 
     @abstractmethod
     async def shutdown(self) -> None:
-        pass  # pragma: no cover
+        """Call any shutdown hooks to help server close gracefully."""
 
     async def cleanup(self) -> None:
-        loop = asyncio.get_event_loop()
-
         # The loop over sites is intentional, an exception on gather()
         # leaves self._sites in unpredictable state.
         # The loop guarantees that a site is either deleted on success or
         # still present on failure
         for site in list(self._sites):
             await site.stop()
+
+        if self._server:  # If setup succeeded
+            # Yield to event loop to ensure incoming requests prior to stopping the sites
+            # have all started to be handled before we proceed to close idle connections.
+            await asyncio.sleep(0)
+            self._server.pre_shutdown()
+            await self.shutdown()
+            await self._server.shutdown(self._shutdown_timeout)
         await self._cleanup_server()
+
         self._server = None
         if self._handle_signals:
+            loop = asyncio.get_running_loop()
             try:
                 loop.remove_signal_handler(signal.SIGINT)
                 loop.remove_signal_handler(signal.SIGTERM)
-            except NotImplementedError:  # pragma: no cover
+            except NotImplementedError:
                 # remove_signal_handler is not implemented on Windows
                 pass
 
     @abstractmethod
-    async def _make_server(self) -> Server:
-        pass  # pragma: no cover
+    async def _make_server(self) -> Server[_Request]:
+        """Return a new server for the runner to serve requests."""
 
     @abstractmethod
     async def _cleanup_server(self) -> None:
-        pass  # pragma: no cover
+        """Run any cleanup steps after the server is shutdown."""
 
     def _reg_site(self, site: BaseSite) -> None:
         if site in self._sites:
@@ -330,13 +411,17 @@ class BaseRunner(ABC):
         self._sites.remove(site)
 
 
-class ServerRunner(BaseRunner):
+class ServerRunner(BaseRunner[BaseRequest]):
     """Low-level web server runner"""
 
     __slots__ = ("_web_server",)
 
     def __init__(
-        self, web_server: Server, *, handle_signals: bool = False, **kwargs: Any
+        self,
+        web_server: Server[BaseRequest],
+        *,
+        handle_signals: bool = False,
+        **kwargs: Unpack[_ServerRunnerKwargs],
     ) -> None:
         super().__init__(handle_signals=handle_signals, **kwargs)
         self._web_server = web_server
@@ -344,14 +429,14 @@ class ServerRunner(BaseRunner):
     async def shutdown(self) -> None:
         pass
 
-    async def _make_server(self) -> Server:
+    async def _make_server(self) -> Server[BaseRequest]:
         return self._web_server
 
     async def _cleanup_server(self) -> None:
         pass
 
 
-class AppRunner(BaseRunner):
+class AppRunner(BaseRunner[Request]):
     """Web Application runner"""
 
     __slots__ = ("_app",)
@@ -361,30 +446,28 @@ class AppRunner(BaseRunner):
         app: Application,
         *,
         handle_signals: bool = False,
-        access_log_class: Type[AbstractAccessLogger] = AccessLogger,
-        **kwargs: Any,
+        access_log_class: type[AbstractAccessLogger] = AccessLogger,
+        **kwargs: Unpack[_RunnerKwargs],
     ) -> None:
-
         if not isinstance(app, Application):
             raise TypeError(
-                "The first argument should be web.Application "
-                "instance, got {!r}".format(app)
+                f"The first argument should be web.Application instance, got {app!r}"
             )
-        kwargs["access_log_class"] = access_log_class
+        server_kwargs: dict[str, Any] = {**kwargs, "access_log_class": access_log_class}
 
         if app._handler_args:
             for k, v in app._handler_args.items():
-                kwargs[k] = v
+                server_kwargs[k] = v
 
-        if not issubclass(kwargs["access_log_class"], AbstractAccessLogger):
+        if not issubclass(server_kwargs["access_log_class"], AbstractAccessLogger):
             raise TypeError(
                 "access_log_class must be subclass of "
                 "aiohttp.abc.AbstractAccessLogger, got {}".format(
-                    kwargs["access_log_class"]
+                    server_kwargs["access_log_class"]
                 )
             )
 
-        super().__init__(handle_signals=handle_signals, **kwargs)
+        super().__init__(handle_signals=handle_signals, **server_kwargs)
         self._app = app
 
     @property
@@ -394,13 +477,13 @@ class AppRunner(BaseRunner):
     async def shutdown(self) -> None:
         await self._app.shutdown()
 
-    async def _make_server(self) -> Server:
+    async def _make_server(self) -> Server[Request]:
         self._app.on_startup.freeze()
         await self._app.startup()
         self._app.freeze()
 
         return Server(
-            self._app._handle,  # type: ignore[arg-type]
+            self._app._handle,
             request_factory=self._make_request,
             **self._kwargs,
         )
@@ -409,10 +492,11 @@ class AppRunner(BaseRunner):
         self,
         message: RawRequestMessage,
         payload: StreamReader,
-        protocol: RequestHandler,
+        protocol: RequestHandler[Request],
         writer: AbstractStreamWriter,
         task: "asyncio.Task[None]",
-        _cls: Type[Request] = Request,
+        pre_handler_error: HTTPBadRequest | None,
+        _cls: type[Request] = Request,
     ) -> Request:
         loop = asyncio.get_running_loop()
         return _cls(
@@ -423,6 +507,8 @@ class AppRunner(BaseRunner):
             task,
             loop,
             client_max_size=self.app._client_max_size,
+            client_max_fields=self.app._client_max_fields,
+            pre_handler_error=pre_handler_error,
         )
 
     async def _cleanup_server(self) -> None:

@@ -1,23 +1,29 @@
-# type: ignore
 import asyncio
-import base64
 import datetime
 import gc
-import platform
-from math import isclose, modf
+import ipaddress
+import itertools
+import sys
+import weakref
+from collections.abc import Iterator
+from math import ceil, modf
+from pathlib import Path
+from types import MappingProxyType
 from unittest import mock
 from urllib.request import getproxies_environment
 
 import pytest
-from multidict import CIMultiDict, MultiDict
-from re_assert import Matches
+from multidict import CIMultiDict, MultiDict, MultiDictProxy
 from yarl import URL
 
-from aiohttp import helpers
-from aiohttp.helpers import is_expected_content_type, parse_http_date
-
-IS_PYPY = platform.python_implementation() == "PyPy"
-
+from aiohttp import helpers, web
+from aiohttp.helpers import (
+    EMPTY_BODY_METHODS,
+    is_expected_content_type,
+    must_be_empty_body,
+    parse_http_date,
+    should_remove_content_length,
+)
 
 # ------------------- parse_mimetype ----------------------------------
 
@@ -25,54 +31,113 @@ IS_PYPY = platform.python_implementation() == "PyPy"
 @pytest.mark.parametrize(
     "mimetype, expected",
     [
-        ("", helpers.MimeType("", "", "", MultiDict())),
-        ("*", helpers.MimeType("*", "*", "", MultiDict())),
-        ("application/json", helpers.MimeType("application", "json", "", MultiDict())),
+        ("", helpers.MimeType("", "", "", MultiDictProxy(MultiDict()))),
+        ("*", helpers.MimeType("*", "*", "", MultiDictProxy(MultiDict()))),
+        (
+            "application/json",
+            helpers.MimeType("application", "json", "", MultiDictProxy(MultiDict())),
+        ),
         (
             "application/json;  charset=utf-8",
             helpers.MimeType(
-                "application", "json", "", MultiDict({"charset": "utf-8"})
+                "application",
+                "json",
+                "",
+                MultiDictProxy(MultiDict({"charset": "utf-8"})),
             ),
         ),
         (
             """application/json; charset=utf-8;""",
             helpers.MimeType(
-                "application", "json", "", MultiDict({"charset": "utf-8"})
+                "application",
+                "json",
+                "",
+                MultiDictProxy(MultiDict({"charset": "utf-8"})),
             ),
         ),
         (
             'ApPlIcAtIoN/JSON;ChaRseT="UTF-8"',
             helpers.MimeType(
-                "application", "json", "", MultiDict({"charset": "UTF-8"})
+                "application",
+                "json",
+                "",
+                MultiDictProxy(MultiDict({"charset": "UTF-8"})),
             ),
         ),
         (
             "application/rss+xml",
-            helpers.MimeType("application", "rss", "xml", MultiDict()),
+            helpers.MimeType("application", "rss", "xml", MultiDictProxy(MultiDict())),
         ),
         (
             "text/plain;base64",
-            helpers.MimeType("text", "plain", "", MultiDict({"base64": ""})),
+            helpers.MimeType(
+                "text", "plain", "", MultiDictProxy(MultiDict({"base64": ""}))
+            ),
+        ),
+        (
+            "text/html; ",
+            helpers.MimeType("text", "html", "", MultiDictProxy(MultiDict())),
+        ),
+        (
+            "text/html;  ",
+            helpers.MimeType("text", "html", "", MultiDictProxy(MultiDict())),
+        ),
+        (
+            "text/html;\t",
+            helpers.MimeType("text", "html", "", MultiDictProxy(MultiDict())),
+        ),
+        (
+            "text/html; charset=utf-8; ",
+            helpers.MimeType(
+                "text",
+                "html",
+                "",
+                MultiDictProxy(MultiDict({"charset": "utf-8"})),
+            ),
         ),
     ],
 )
-def test_parse_mimetype(mimetype, expected) -> None:
+def test_parse_mimetype(mimetype: str, expected: helpers.MimeType) -> None:
     result = helpers.parse_mimetype(mimetype)
 
     assert isinstance(result, helpers.MimeType)
     assert result == expected
 
 
+# ------------------- parse_content_type ------------------------------
+
+
+@pytest.mark.parametrize(
+    "content_type, expected",
+    [
+        (
+            "text/plain",
+            ("text/plain", MultiDictProxy(MultiDict())),
+        ),
+        (
+            "wrong",
+            ("application/octet-stream", MultiDictProxy(MultiDict())),
+        ),
+    ],
+)
+def test_parse_content_type(
+    content_type: str, expected: tuple[str, MappingProxyType[str, str]]
+) -> None:
+    result = helpers.parse_content_type(content_type)
+
+    assert result == expected
+
+
 # ------------------- guess_filename ----------------------------------
 
 
-def test_guess_filename_with_file_object(tmp_path) -> None:
+def test_guess_filename_with_file_object(tmp_path: Path) -> None:
     file_path = tmp_path / "test_guess_filename"
     with file_path.open("w+b") as fp:
         assert helpers.guess_filename(fp, "no-throw") is not None
 
 
-def test_guess_filename_with_path(tmp_path) -> None:
+def test_guess_filename_with_path(tmp_path: Path) -> None:
     file_path = tmp_path / "test_guess_filename"
     assert helpers.guess_filename(file_path, "no-throw") is not None
 
@@ -81,165 +146,54 @@ def test_guess_filename_with_default() -> None:
     assert helpers.guess_filename(None, "no-throw") == "no-throw"
 
 
-# ------------------- BasicAuth -----------------------------------
+# ------------------- encode_basic_auth -----------------------------------
 
 
-def test_basic_auth1() -> None:
-    # missing password here
-    with pytest.raises(ValueError):
-        helpers.BasicAuth(None)
+def test_encode_basic_auth() -> None:
+    assert helpers.encode_basic_auth("nkim", "pwd") == "Basic bmtpbTpwd2Q="
 
 
-def test_basic_auth2() -> None:
-    with pytest.raises(ValueError):
-        helpers.BasicAuth("nkim", None)
+def test_encode_basic_auth_default_password() -> None:
+    assert helpers.encode_basic_auth("nkim") == "Basic bmtpbTo="
 
 
-def test_basic_with_auth_colon_in_login() -> None:
-    with pytest.raises(ValueError):
-        helpers.BasicAuth("nkim:1", "pwd")
+def test_encode_basic_auth_blank_login_and_password() -> None:
+    assert helpers.encode_basic_auth("") == "Basic Og=="
 
 
-def test_basic_auth3() -> None:
-    auth = helpers.BasicAuth("nkim")
-    assert auth.login == "nkim"
-    assert auth.password == ""
+def test_encode_basic_auth_utf8() -> None:
+    assert helpers.encode_basic_auth("usér", "pàss") == "Basic dXPDqXI6cMOgc3M="
 
 
-def test_basic_auth4() -> None:
-    auth = helpers.BasicAuth("nkim", "pwd")
-    assert auth.login == "nkim"
-    assert auth.password == "pwd"
-    assert auth.encode() == "Basic bmtpbTpwd2Q="
+def test_encode_basic_auth_latin1() -> None:
+    assert (
+        helpers.encode_basic_auth("nkim", "café", encoding="latin1")
+        == "Basic bmtpbTpjYWbp"
+    )
 
 
-@pytest.mark.parametrize(
-    "header",
-    (
-        "Basic bmtpbTpwd2Q=",
-        "basic bmtpbTpwd2Q=",
-    ),
-)
-def test_basic_auth_decode(header) -> None:
-    auth = helpers.BasicAuth.decode(header)
-    assert auth.login == "nkim"
-    assert auth.password == "pwd"
+def test_encode_basic_auth_rejects_colon_in_login() -> None:
+    with pytest.raises(ValueError, match=r'":" is not allowed in login.*RFC 7617'):
+        helpers.encode_basic_auth("user:1", "pwd")
 
 
-def test_basic_auth_invalid() -> None:
-    with pytest.raises(ValueError):
-        helpers.BasicAuth.decode("bmtpbTpwd2Q=")
+def test_strip_auth_from_url() -> None:
+    url, auth = helpers.strip_auth_from_url(URL("http://user:pass@example.com/"))
+    assert url == URL("http://example.com/")
+    assert auth == helpers.encode_basic_auth("user", "pass")
 
 
-def test_basic_auth_decode_not_basic() -> None:
-    with pytest.raises(ValueError):
-        helpers.BasicAuth.decode("Complex bmtpbTpwd2Q=")
+def test_strip_auth_from_url_no_user() -> None:
+    url, auth = helpers.strip_auth_from_url(URL("http://:pass@example.com/"))
+    assert url == URL("http://example.com/")
+    assert auth == helpers.encode_basic_auth("", "pass")
 
 
-def test_basic_auth_decode_bad_base64() -> None:
-    with pytest.raises(ValueError):
-        helpers.BasicAuth.decode("Basic bmtpbTpwd2Q")
-
-
-@pytest.mark.parametrize("header", ("Basic ???", "Basic   "))
-def test_basic_auth_decode_illegal_chars_base64(header) -> None:
-    with pytest.raises(ValueError, match="Invalid base64 encoding."):
-        helpers.BasicAuth.decode(header)
-
-
-def test_basic_auth_decode_invalid_credentials() -> None:
-    with pytest.raises(ValueError, match="Invalid credentials."):
-        header = "Basic {}".format(base64.b64encode(b"username").decode())
-        helpers.BasicAuth.decode(header)
-
-
-@pytest.mark.parametrize(
-    "credentials, expected_auth",
-    (
-        (":", helpers.BasicAuth(login="", password="", encoding="latin1")),
-        (
-            "username:",
-            helpers.BasicAuth(login="username", password="", encoding="latin1"),
-        ),
-        (
-            ":password",
-            helpers.BasicAuth(login="", password="password", encoding="latin1"),
-        ),
-        (
-            "username:password",
-            helpers.BasicAuth(login="username", password="password", encoding="latin1"),
-        ),
-    ),
-)
-def test_basic_auth_decode_blank_username(credentials, expected_auth) -> None:
-    header = f"Basic {base64.b64encode(credentials.encode()).decode()}"
-    assert helpers.BasicAuth.decode(header) == expected_auth
-
-
-def test_basic_auth_from_url() -> None:
-    url = URL("http://user:pass@example.com")
-    auth = helpers.BasicAuth.from_url(url)
-    assert auth.login == "user"
-    assert auth.password == "pass"
-
-
-def test_basic_auth_from_not_url() -> None:
-    with pytest.raises(TypeError):
-        helpers.BasicAuth.from_url("http://user:pass@example.com")
-
-
-class ReifyMixin:
-
-    reify = NotImplemented
-
-    def test_reify(self) -> None:
-        class A:
-            def __init__(self):
-                self._cache = {}
-
-            @self.reify
-            def prop(self):
-                return 1
-
-        a = A()
-        assert 1 == a.prop
-
-    def test_reify_class(self) -> None:
-        class A:
-            def __init__(self):
-                self._cache = {}
-
-            @self.reify
-            def prop(self):
-                """Docstring."""
-                return 1
-
-        assert isinstance(A.prop, self.reify)
-        assert "Docstring." == A.prop.__doc__
-
-    def test_reify_assignment(self) -> None:
-        class A:
-            def __init__(self):
-                self._cache = {}
-
-            @self.reify
-            def prop(self):
-                return 1
-
-        a = A()
-
-        with pytest.raises(AttributeError):
-            a.prop = 123
-
-
-class TestPyReify(ReifyMixin):
-    reify = helpers.reify_py
-
-
-if not helpers.NO_EXTENSIONS and not IS_PYPY and hasattr(helpers, "reify_c"):
-
-    class TestCReify(ReifyMixin):
-        reify = helpers.reify_c
+def test_strip_auth_from_url_no_auth() -> None:
+    url = URL("http://example.com/")
+    stripped, auth = helpers.strip_auth_from_url(url)
+    assert stripped is url
+    assert auth is None
 
 
 # ----------------------------------- is_ip_address() ----------------------
@@ -254,32 +208,6 @@ def test_is_ip_address() -> None:
     assert not helpers.is_ip_address("localhost")
     assert not helpers.is_ip_address("www.example.com")
 
-    # Out of range
-    assert not helpers.is_ip_address("999.999.999.999")
-    # Contain a port
-    assert not helpers.is_ip_address("127.0.0.1:80")
-    assert not helpers.is_ip_address("[2001:db8:0:1]:80")
-    # Too many "::"
-    assert not helpers.is_ip_address("1200::AB00:1234::2552:7777:1313")
-
-
-def test_is_ip_address_bytes() -> None:
-    assert helpers.is_ip_address(b"127.0.0.1")
-    assert helpers.is_ip_address(b"::1")
-    assert helpers.is_ip_address(b"FE80:0000:0000:0000:0202:B3FF:FE1E:8329")
-
-    # Hostnames
-    assert not helpers.is_ip_address(b"localhost")
-    assert not helpers.is_ip_address(b"www.example.com")
-
-    # Out of range
-    assert not helpers.is_ip_address(b"999.999.999.999")
-    # Contain a port
-    assert not helpers.is_ip_address(b"127.0.0.1:80")
-    assert not helpers.is_ip_address(b"[2001:db8:0:1]:80")
-    # Too many "::"
-    assert not helpers.is_ip_address(b"1200::AB00:1234::2552:7777:1313")
-
 
 def test_ipv4_addresses() -> None:
     ip_addresses = [
@@ -288,8 +216,6 @@ def test_ipv4_addresses() -> None:
         "255.255.255.255",
     ]
     for address in ip_addresses:
-        assert helpers.is_ipv4_address(address)
-        assert not helpers.is_ipv6_address(address)
         assert helpers.is_ip_address(address)
 
 
@@ -305,14 +231,13 @@ def test_ipv6_addresses() -> None:
         "1::1",
     ]
     for address in ip_addresses:
-        assert not helpers.is_ipv4_address(address)
-        assert helpers.is_ipv6_address(address)
         assert helpers.is_ip_address(address)
 
 
 def test_host_addresses() -> None:
     hosts = [
-        "www.four.part.host" "www.python.org",
+        "www.four.part.host",
+        "www.python.org",
         "foo.bar",
         "localhost",
     ]
@@ -322,17 +247,104 @@ def test_host_addresses() -> None:
 
 def test_is_ip_address_invalid_type() -> None:
     with pytest.raises(TypeError):
-        helpers.is_ip_address(123)
+        helpers.is_ip_address(123)  # type: ignore[arg-type]
 
     with pytest.raises(TypeError):
-        helpers.is_ip_address(object())
+        helpers.is_ip_address(object())  # type: ignore[arg-type]
+
+
+# ------------------------------- is_canonical_ipv4_address() ---------------
+
+
+@pytest.mark.parametrize(
+    "host",
+    [
+        "0.0.0.0",
+        "127.0.0.1",
+        "8.8.8.8",
+        "192.168.0.1",
+        "255.255.255.255",
+    ],
+)
+def test_is_canonical_ipv4_address_accepts_dotted_quad(host: str) -> None:
+    assert helpers.is_canonical_ipv4_address(host)
+
+
+@pytest.mark.parametrize(
+    "host",
+    [
+        "2130706433",  # decimal integer form of 127.0.0.1
+        "017700000001",  # octal form of 127.0.0.1
+        "127.1",  # short-hand form of 127.0.0.1
+        "127.0.1",  # 3-part short-hand
+        "0177.0.0.1",  # octal leading-zero octet
+        "01.2.3.4",  # octal leading-zero octet
+        "256.0.0.1",  # octet out of range
+        "999.0.0.1",  # octet out of range
+        "1.2.3.4.5",  # too many octets
+        "127.0.0.",  # trailing dot / empty octet
+        "12³.0.0.1",  # superscript digit (str.isdigit but not int)
+        "１２７.0.0.1",  # full-width digits
+        "0xa.0.0.0",  # hex octet
+        " 127.0.0.1",  # leading whitespace
+        "127.0.0.1 ",  # trailing whitespace
+        "example.com",  # domain name
+        "",  # empty
+    ],
+)
+def test_is_canonical_ipv4_address_rejects_non_canonical(host: str) -> None:
+    assert not helpers.is_canonical_ipv4_address(host)
+
+
+def _ipaddress_accepts_ipv4(host: str) -> bool:
+    """Oracle: does the stdlib accept ``host`` as a canonical IPv4 address?"""
+    try:
+        ipaddress.IPv4Address(host)
+    except ipaddress.AddressValueError:
+        return False
+    return True
+
+
+def test_is_canonical_ipv4_address_matches_stdlib() -> None:
+    """Prove equivalence with ``ipaddress.IPv4Address`` over a broad corpus.
+
+    The helper is a fast hand-rolled substitute for the stdlib parser; this
+    exhaustively cross-checks the two agree on every combination of a set of
+    octet-like tokens covering the known edge cases (leading zeros, out of
+    range, empty, unicode digits, wrong octet count).
+    """
+    tokens = [
+        "0",
+        "1",
+        "9",
+        "10",
+        "99",
+        "255",
+        "256",
+        "999",
+        "00",
+        "01",
+        "0177",
+        "1234",
+        "",
+        "a",
+        "0x1",
+        "１",  # full-width 1
+        "1²",  # trailing superscript
+    ]
+    for count in range(1, 5):
+        for parts in itertools.product(tokens, repeat=count):
+            host = ".".join(parts)
+            assert helpers.is_canonical_ipv4_address(host) == _ipaddress_accepts_ipv4(
+                host
+            ), host
 
 
 # ----------------------------------- TimeoutHandle -------------------
 
 
-def test_timeout_handle(loop) -> None:
-    handle = helpers.TimeoutHandle(loop, 10.2)
+def test_timeout_handle(event_loop: asyncio.AbstractEventLoop) -> None:
+    handle = helpers.TimeoutHandle(event_loop, 10.2)
     cb = mock.Mock()
     handle.register(cb)
     assert cb == handle._callbacks[0][0]
@@ -340,20 +352,41 @@ def test_timeout_handle(loop) -> None:
     assert not handle._callbacks
 
 
-def test_when_timeout_smaller_second(loop) -> None:
+def test_when_timeout_smaller_second(event_loop: asyncio.AbstractEventLoop) -> None:
     timeout = 0.1
-    timer = loop.time() + timeout
 
-    handle = helpers.TimeoutHandle(loop, timeout)
-    when = handle.start()._when
+    handle = helpers.TimeoutHandle(event_loop, timeout)
+    before = event_loop.time()
+    start_handle = handle.start()
+    after = event_loop.time()
+    assert start_handle is not None
+    when = start_handle.when()
     handle.close()
 
+    # Below the ceil threshold the deadline keeps sub-second precision.
     assert isinstance(when, float)
-    assert isclose(when - timer, 0, abs_tol=0.001)
+    assert before + timeout <= when <= after + timeout
 
 
-def test_timeout_handle_cb_exc(loop) -> None:
-    handle = helpers.TimeoutHandle(loop, 10.2)
+def test_when_timeout_smaller_second_with_low_threshold(
+    event_loop: asyncio.AbstractEventLoop,
+) -> None:
+    timeout = 0.1
+
+    handle = helpers.TimeoutHandle(event_loop, timeout, 0.01)
+    before = event_loop.time()
+    start_handle = handle.start()
+    after = event_loop.time()
+    assert start_handle is not None
+    when = start_handle.when()
+    handle.close()
+
+    assert isinstance(when, int)
+    assert ceil(before + timeout) <= when <= ceil(after + timeout)
+
+
+def test_timeout_handle_cb_exc(event_loop: asyncio.AbstractEventLoop) -> None:
+    handle = helpers.TimeoutHandle(event_loop, 10.2)
     cb = mock.Mock()
     handle.register(cb)
     cb.side_effect = ValueError()
@@ -376,22 +409,78 @@ def test_timer_context_not_cancelled() -> None:
         assert not m_asyncio.current_task.return_value.cancel.called
 
 
-def test_timer_context_no_task(loop) -> None:
+async def test_timer_context_timeout_does_not_leak_upward() -> None:
+    """Verify that the TimerContext does not leak cancellation outside the context manager."""
+    loop = asyncio.get_running_loop()
+    ctx = helpers.TimerContext(loop)
+    current_task = asyncio.current_task()
+    assert current_task is not None
+    with pytest.raises(asyncio.TimeoutError):
+        with ctx:
+            assert current_task.cancelling() == 0
+            loop.call_soon(ctx.timeout)
+            await asyncio.sleep(1)
+
+    # After the context manager exits, the task should no longer be cancelling
+    assert current_task.cancelling() == 0
+
+
+async def test_timer_context_timeout_does_swallow_cancellation() -> None:
+    """Verify that the TimerContext does not swallow cancellation."""
+    current_task = asyncio.current_task()
+    assert current_task is not None
+    ctx = helpers.TimerContext(asyncio.get_running_loop())
+
+    async def task_with_timeout() -> None:
+        new_task = asyncio.current_task()
+        assert new_task is not None
+        with pytest.raises(asyncio.TimeoutError):
+            with ctx:
+                assert new_task.cancelling() == 0
+                await asyncio.sleep(1)
+
+    task = asyncio.create_task(task_with_timeout())
+    await asyncio.sleep(0)
+    task.cancel()
+    assert task.cancelling() == 1
+    ctx.timeout()
+
+    # Cancellation should not leak into the current task
+    assert current_task.cancelling() == 0
+    # Cancellation should not be swallowed if the task is cancelled
+    # and it also times out
+    await asyncio.sleep(0)
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert task.cancelling() == 1
+
+
+def test_timer_context_no_task(event_loop: asyncio.AbstractEventLoop) -> None:
     with pytest.raises(RuntimeError):
-        with helpers.TimerContext(loop):
+        with helpers.TimerContext(event_loop):
             pass
 
 
-async def test_weakref_handle(loop) -> None:
+async def test_weakref_handle() -> None:
     cb = mock.Mock()
-    helpers.weakref_handle(cb, "test", 0.01, loop)
+    helpers.weakref_handle(cb, "test", 0.01, asyncio.get_running_loop())
     await asyncio.sleep(0.1)
     assert cb.test.called
 
 
-async def test_weakref_handle_weak(loop) -> None:
+async def test_weakref_handle_with_small_threshold() -> None:
     cb = mock.Mock()
-    helpers.weakref_handle(cb, "test", 0.01, loop)
+    loop = mock.Mock()
+    loop.time.return_value = 10
+    helpers.weakref_handle(cb, "test", 0.1, loop, 0.01)
+    loop.call_at.assert_called_with(
+        11, helpers._weakref_handle, (weakref.ref(cb), "test")
+    )
+
+
+async def test_weakref_handle_weak() -> None:
+    cb = mock.Mock()
+    helpers.weakref_handle(cb, "test", 0.01, asyncio.get_running_loop())
     del cb
     gc.collect()
     await asyncio.sleep(0.1)
@@ -408,6 +497,31 @@ def test_ceil_call_later() -> None:
     loop.call_at.assert_called_with(21.0, cb)
 
 
+async def test_ceil_timeout_round() -> None:
+    async with helpers.ceil_timeout(7.5) as cm:
+        w = cm.when()
+        assert w is not None
+        frac, integer = modf(w)
+        assert frac == 0
+
+
+async def test_ceil_timeout_small() -> None:
+    async with helpers.ceil_timeout(1.1) as cm:
+        w = cm.when()
+        assert w is not None
+        frac, integer = modf(w)
+        # a chance for exact integer with zero fraction is negligible
+        assert frac != 0
+
+
+def test_ceil_call_later_with_small_threshold() -> None:
+    cb = mock.Mock()
+    loop = mock.Mock()
+    loop.time.return_value = 10.1
+    helpers.call_later(cb, 4.5, loop, 1)
+    loop.call_at.assert_called_with(15, cb)
+
+
 def test_ceil_call_later_no_timeout() -> None:
     cb = mock.Mock()
     loop = mock.Mock()
@@ -415,46 +529,48 @@ def test_ceil_call_later_no_timeout() -> None:
     assert not loop.call_at.called
 
 
-async def test_ceil_timeout_none(loop) -> None:
+async def test_ceil_timeout_none() -> None:
     async with helpers.ceil_timeout(None) as cm:
-        assert cm.deadline is None
+        assert cm.when() is None
 
 
-async def test_ceil_timeout_round(loop) -> None:
-    async with helpers.ceil_timeout(7.5) as cm:
-        frac, integer = modf(cm.deadline)
+async def test_ceil_timeout_small_with_overriden_threshold() -> None:
+    async with helpers.ceil_timeout(1.5, ceil_threshold=1) as cm:
+        w = cm.when()
+        assert w is not None
+        frac, integer = modf(w)
         assert frac == 0
-
-
-async def test_ceil_timeout_small(loop) -> None:
-    async with helpers.ceil_timeout(1.1) as cm:
-        frac, integer = modf(cm.deadline)
-        # a chance for exact integer with zero fraction is negligible
-        assert frac != 0
 
 
 # -------------------------------- ContentDisposition -------------------
 
 
 @pytest.mark.parametrize(
-    "kwargs, result",
+    "params, quote_fields, _charset, expected",
     [
-        (dict(foo="bar"), 'attachment; foo="bar"'),
-        (dict(foo="bar[]"), 'attachment; foo="bar[]"'),
-        (dict(foo=' a""b\\'), 'attachment; foo="\\ a\\"\\"b\\\\"'),
-        (dict(foo="bär"), "attachment; foo*=utf-8''b%C3%A4r"),
-        (dict(foo='bär "\\', quote_fields=False), 'attachment; foo="bär \\"\\\\"'),
-        (dict(foo="bär", _charset="latin-1"), "attachment; foo*=latin-1''b%E4r"),
-        (dict(filename="bär"), 'attachment; filename="b%C3%A4r"'),
-        (dict(filename="bär", _charset="latin-1"), 'attachment; filename="b%E4r"'),
+        (dict(foo="bar"), True, "utf-8", 'attachment; foo="bar"'),
+        (dict(foo="bar[]"), True, "utf-8", 'attachment; foo="bar[]"'),
+        (dict(foo=' a""b\\'), True, "utf-8", 'attachment; foo="\\ a\\"\\"b\\\\"'),
+        (dict(foo="bär"), True, "utf-8", "attachment; foo*=utf-8''b%C3%A4r"),
+        (dict(foo='bär "\\'), False, "utf-8", 'attachment; foo="bär \\"\\\\"'),
+        (dict(foo="bär"), True, "latin-1", "attachment; foo*=latin-1''b%E4r"),
+        (dict(filename="bär"), True, "utf-8", 'attachment; filename="b%C3%A4r"'),
+        (dict(filename="bär"), True, "latin-1", 'attachment; filename="b%E4r"'),
         (
-            dict(filename='bär "\\', quote_fields=False),
+            dict(filename='bär "\\'),
+            False,
+            "utf-8",
             'attachment; filename="bär \\"\\\\"',
         ),
     ],
 )
-def test_content_disposition(kwargs, result) -> None:
-    assert helpers.content_disposition_header("attachment", **kwargs) == result
+def test_content_disposition(
+    params: dict[str, str], quote_fields: bool, _charset: str, expected: str
+) -> None:
+    result = helpers.content_disposition_header(
+        "attachment", quote_fields=quote_fields, _charset=_charset, params=params
+    )
+    assert result == expected
 
 
 def test_content_disposition_bad_type() -> None:
@@ -470,13 +586,13 @@ def test_content_disposition_bad_type() -> None:
 
 def test_set_content_disposition_bad_param() -> None:
     with pytest.raises(ValueError):
-        helpers.content_disposition_header("inline", **{"foo bar": "baz"})
+        helpers.content_disposition_header("inline", params={"foo bar": "baz"})
     with pytest.raises(ValueError):
-        helpers.content_disposition_header("inline", **{"—Ç–µ—Å—Ç": "baz"})
+        helpers.content_disposition_header("inline", params={"—Ç–µ—Å—Ç": "baz"})
     with pytest.raises(ValueError):
-        helpers.content_disposition_header("inline", **{"": "baz"})
+        helpers.content_disposition_header("inline", params={"": "baz"})
     with pytest.raises(ValueError):
-        helpers.content_disposition_header("inline", **{"foo\x00bar": "baz"})
+        helpers.content_disposition_header("inline", params={"foo\x00bar": "baz"})
 
 
 # --------------------- proxies_from_env ------------------------------
@@ -494,7 +610,7 @@ def test_set_content_disposition_bad_param() -> None:
     ids=("http", "https", "ws", "wss"),
 )
 @pytest.mark.usefixtures("proxy_env_vars")
-def test_proxies_from_env(url_input, expected_scheme) -> None:
+def test_proxies_from_env(url_input: str, expected_scheme: str) -> None:
     url = URL(url_input)
     ret = helpers.proxies_from_env()
     assert ret.keys() == {expected_scheme}
@@ -516,12 +632,14 @@ def test_proxies_from_env(url_input, expected_scheme) -> None:
     ids=("https", "wss"),
 )
 @pytest.mark.usefixtures("proxy_env_vars")
-def test_proxies_from_env_skipped(caplog, url_input, expected_scheme) -> None:
+def test_proxies_from_env_skipped(
+    caplog: pytest.LogCaptureFixture, url_input: str, expected_scheme: str
+) -> None:
     url = URL(url_input)
     assert helpers.proxies_from_env() == {}
     assert len(caplog.records) == 1
-    log_message = "{proto!s} proxies {url!s} are not supported, ignoring".format(
-        proto=expected_scheme.upper(), url=url
+    log_message = (
+        f"{expected_scheme.upper()!s} proxies {url!s} are not supported, ignoring"
     )
     assert caplog.record_tuples == [("aiohttp.client", 30, log_message)]
 
@@ -539,22 +657,21 @@ def test_proxies_from_env_skipped(caplog, url_input, expected_scheme) -> None:
     ids=("http",),
 )
 @pytest.mark.usefixtures("proxy_env_vars")
-def test_proxies_from_env_http_with_auth(url_input, expected_scheme) -> None:
+def test_proxies_from_env_http_with_auth(url_input: str, expected_scheme: str) -> None:
     url = URL("http://user:pass@aiohttp.io/path")
     ret = helpers.proxies_from_env()
     assert ret.keys() == {expected_scheme}
     assert ret[expected_scheme].proxy == url.with_user(None)
-    proxy_auth = ret[expected_scheme].proxy_auth
-    assert proxy_auth.login == "user"
-    assert proxy_auth.password == "pass"
-    assert proxy_auth.encoding == "latin1"
+    assert ret[expected_scheme].proxy_auth == helpers.encode_basic_auth("user", "pass")
 
 
 # --------------------- get_env_proxy_for_url ------------------------------
 
 
 @pytest.fixture
-def proxy_env_vars(monkeypatch, request):
+def proxy_env_vars(
+    monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest
+) -> object:
     for schema in getproxies_environment().keys():
         monkeypatch.delenv(f"{schema}_proxy", False)
 
@@ -609,7 +726,7 @@ def proxy_env_vars(monkeypatch, request):
     ),
 )
 @pytest.mark.usefixtures("proxy_env_vars")
-def test_get_env_proxy_for_url_negative(url_input, expected_err_msg) -> None:
+def test_get_env_proxy_for_url_negative(url_input: str, expected_err_msg: str) -> None:
     url = URL(url_input)
     with pytest.raises(LookupError, match=expected_err_msg):
         helpers.get_env_proxy_for_url(url)
@@ -632,7 +749,7 @@ def test_get_env_proxy_for_url_negative(url_input, expected_err_msg) -> None:
         "url_scheme_match_http_proxy_list_multiple",
     ),
 )
-def test_get_env_proxy_for_url(proxy_env_vars, url_input) -> None:
+def test_get_env_proxy_for_url(proxy_env_vars: dict[str, str], url_input: str) -> None:
     url = URL(url_input)
     proxy, proxy_auth = helpers.get_env_proxy_for_url(url)
     proxy_list = proxy_env_vars[url.scheme + "_proxy"]
@@ -643,14 +760,14 @@ def test_get_env_proxy_for_url(proxy_env_vars, url_input) -> None:
 # ------------- set_result / set_exception ----------------------
 
 
-async def test_set_result(loop) -> None:
-    fut = loop.create_future()
+async def test_set_result() -> None:
+    fut = asyncio.get_running_loop().create_future()
     helpers.set_result(fut, 123)
     assert 123 == await fut
 
 
-async def test_set_result_cancelled(loop) -> None:
-    fut = loop.create_future()
+async def test_set_result_cancelled() -> None:
+    fut = asyncio.get_running_loop().create_future()
     fut.cancel()
     helpers.set_result(fut, 123)
 
@@ -658,15 +775,15 @@ async def test_set_result_cancelled(loop) -> None:
         await fut
 
 
-async def test_set_exception(loop) -> None:
-    fut = loop.create_future()
+async def test_set_exception() -> None:
+    fut = asyncio.get_running_loop().create_future()
     helpers.set_exception(fut, RuntimeError())
     with pytest.raises(RuntimeError):
         await fut
 
 
-async def test_set_exception_cancelled(loop) -> None:
-    fut = loop.create_future()
+async def test_set_exception_cancelled() -> None:
+    fut = asyncio.get_running_loop().create_future()
     fut.cancel()
     helpers.set_exception(fut, RuntimeError())
 
@@ -676,60 +793,62 @@ async def test_set_exception_cancelled(loop) -> None:
 
 # ----------- ChainMapProxy --------------------------
 
+AppKeyDict = dict[str | web.AppKey[object], object]
+
 
 class TestChainMapProxy:
     def test_inheritance(self) -> None:
         with pytest.raises(TypeError):
 
-            class A(helpers.ChainMapProxy):
+            class A(helpers.ChainMapProxy):  # type: ignore[misc]
                 pass
 
     def test_getitem(self) -> None:
-        d1 = {"a": 2, "b": 3}
-        d2 = {"a": 1}
+        d1: AppKeyDict = {"a": 2, "b": 3}
+        d2: AppKeyDict = {"a": 1}
         cp = helpers.ChainMapProxy([d1, d2])
         assert cp["a"] == 2
         assert cp["b"] == 3
 
     def test_getitem_not_found(self) -> None:
-        d = {"a": 1}
+        d: AppKeyDict = {"a": 1}
         cp = helpers.ChainMapProxy([d])
         with pytest.raises(KeyError):
             cp["b"]
 
     def test_get(self) -> None:
-        d1 = {"a": 2, "b": 3}
-        d2 = {"a": 1}
+        d1: AppKeyDict = {"a": 2, "b": 3}
+        d2: AppKeyDict = {"a": 1}
         cp = helpers.ChainMapProxy([d1, d2])
         assert cp.get("a") == 2
 
     def test_get_default(self) -> None:
-        d1 = {"a": 2, "b": 3}
-        d2 = {"a": 1}
+        d1: AppKeyDict = {"a": 2, "b": 3}
+        d2: AppKeyDict = {"a": 1}
         cp = helpers.ChainMapProxy([d1, d2])
         assert cp.get("c", 4) == 4
 
     def test_get_non_default(self) -> None:
-        d1 = {"a": 2, "b": 3}
-        d2 = {"a": 1}
+        d1: AppKeyDict = {"a": 2, "b": 3}
+        d2: AppKeyDict = {"a": 1}
         cp = helpers.ChainMapProxy([d1, d2])
         assert cp.get("a", 4) == 2
 
     def test_len(self) -> None:
-        d1 = {"a": 2, "b": 3}
-        d2 = {"a": 1}
+        d1: AppKeyDict = {"a": 2, "b": 3}
+        d2: AppKeyDict = {"a": 1}
         cp = helpers.ChainMapProxy([d1, d2])
         assert len(cp) == 2
 
     def test_iter(self) -> None:
-        d1 = {"a": 2, "b": 3}
-        d2 = {"a": 1}
+        d1: AppKeyDict = {"a": 2, "b": 3}
+        d2: AppKeyDict = {"a": 1}
         cp = helpers.ChainMapProxy([d1, d2])
         assert set(cp) == {"a", "b"}
 
     def test_contains(self) -> None:
-        d1 = {"a": 2, "b": 3}
-        d2 = {"a": 1}
+        d1: AppKeyDict = {"a": 2, "b": 3}
+        d2: AppKeyDict = {"a": 1}
         cp = helpers.ChainMapProxy([d1, d2])
         assert "a" in cp
         assert "b" in cp
@@ -741,14 +860,14 @@ class TestChainMapProxy:
         assert not helpers.ChainMapProxy([])
 
     def test_repr(self) -> None:
-        d1 = {"a": 2, "b": 3}
-        d2 = {"a": 1}
+        d1: AppKeyDict = {"a": 2, "b": 3}
+        d2: AppKeyDict = {"a": 1}
         cp = helpers.ChainMapProxy([d1, d2])
         expected = f"ChainMapProxy({d1!r}, {d2!r})"
         assert expected == repr(cp)
 
 
-def test_is_expected_content_type_json_match_exact():
+def test_is_expected_content_type_json_match_exact() -> None:
     expected_ct = "application/json"
     response_ct = "application/json"
     assert is_expected_content_type(
@@ -756,7 +875,7 @@ def test_is_expected_content_type_json_match_exact():
     )
 
 
-def test_is_expected_content_type_json_match_partially():
+def test_is_expected_content_type_json_match_partially() -> None:
     expected_ct = "application/json"
     response_ct = "application/alto-costmap+json"  # mime-type from rfc7285
     assert is_expected_content_type(
@@ -764,7 +883,7 @@ def test_is_expected_content_type_json_match_partially():
     )
 
 
-def test_is_expected_content_type_non_application_json_suffix():
+def test_is_expected_content_type_non_application_json_suffix() -> None:
     expected_ct = "application/json"
     response_ct = "model/gltf+json"  # rfc 6839
     assert is_expected_content_type(
@@ -772,7 +891,7 @@ def test_is_expected_content_type_non_application_json_suffix():
     )
 
 
-def test_is_expected_content_type_non_application_json_private_suffix():
+def test_is_expected_content_type_non_application_json_private_suffix() -> None:
     expected_ct = "application/json"
     response_ct = "x-foo/bar+json"  # rfc 6839
     assert is_expected_content_type(
@@ -780,7 +899,7 @@ def test_is_expected_content_type_non_application_json_private_suffix():
     )
 
 
-def test_is_expected_content_type_json_non_lowercase():
+def test_is_expected_content_type_json_non_lowercase() -> None:
     """Per RFC 2045, media type matching is case insensitive."""
     expected_ct = "application/json"
     response_ct = "Application/JSON"
@@ -789,7 +908,7 @@ def test_is_expected_content_type_json_non_lowercase():
     )
 
 
-def test_is_expected_content_type_json_trailing_chars():
+def test_is_expected_content_type_json_trailing_chars() -> None:
     expected_ct = "application/json"
     response_ct = "application/json-seq"
     assert not is_expected_content_type(
@@ -797,7 +916,7 @@ def test_is_expected_content_type_json_trailing_chars():
     )
 
 
-def test_is_expected_content_type_non_json_match_exact():
+def test_is_expected_content_type_non_json_match_exact() -> None:
     expected_ct = "text/javascript"
     response_ct = "text/javascript"
     assert is_expected_content_type(
@@ -805,7 +924,7 @@ def test_is_expected_content_type_non_json_match_exact():
     )
 
 
-def test_is_expected_content_type_non_json_not_match():
+def test_is_expected_content_type_non_json_not_match() -> None:
     expected_ct = "application/json"
     response_ct = "text/plain"
     assert not is_expected_content_type(
@@ -813,14 +932,25 @@ def test_is_expected_content_type_non_json_not_match():
     )
 
 
-def test_cookies_mixin():
-    sut = helpers.CookieMixin()
+# It's necessary to subclass CookieMixin before using it.
+# See the comments on its __slots__.
+class CookieImplementation(helpers.CookieMixin):
+    pass
+
+
+def test_cookies_mixin() -> None:
+    sut = CookieImplementation()
 
     assert sut.cookies == {}
     assert str(sut.cookies) == ""
 
     sut.set_cookie("name", "value")
     assert str(sut.cookies) == "Set-Cookie: name=value; Path=/"
+    sut.set_cookie("name", "")
+    assert str(sut.cookies) == 'Set-Cookie: name=""; Path=/'
+    sut.set_cookie("name", "value")
+    assert str(sut.cookies) == "Set-Cookie: name=value; Path=/"
+
     sut.set_cookie("name", "other_value")
     assert str(sut.cookies) == "Set-Cookie: name=other_value; Path=/"
 
@@ -832,18 +962,20 @@ def test_cookies_mixin():
 
     sut.del_cookie("name")
     expected = (
-        'Set-Cookie: name=("")?; '
+        'Set-Cookie: name=""; '
         "expires=Thu, 01 Jan 1970 00:00:00 GMT; Max-Age=0; Path=/"
     )
-    assert Matches(expected) == str(sut.cookies)
+    assert str(sut.cookies) == expected
+    sut.del_cookie("name")
+    assert str(sut.cookies) == expected
 
     sut.set_cookie("name", "value", domain="local.host")
     expected = "Set-Cookie: name=value; Domain=local.host; Path=/"
     assert str(sut.cookies) == expected
 
 
-def test_cookies_mixin_path():
-    sut = helpers.CookieMixin()
+def test_cookies_mixin_path() -> None:
+    sut = CookieImplementation()
 
     assert sut.cookies == {}
 
@@ -860,7 +992,6 @@ def test_cookies_mixin_path():
         max_age="10",
         secure=True,
         httponly=True,
-        version="2.0",
         samesite="lax",
     )
     assert (
@@ -871,27 +1002,39 @@ def test_cookies_mixin_path():
         "max-age=10; "
         "path=/home; "
         "samesite=lax; "
-        "secure; "
-        "version=2.0"
+        "secure"
     )
 
 
-def test_sutonse_cookie__issue_del_cookie():
-    sut = helpers.CookieMixin()
+@pytest.mark.skipif(sys.version_info < (3, 14), reason="No partitioned support")
+def test_cookies_mixin_partitioned() -> None:
+    sut = CookieImplementation()
+
+    assert sut.cookies == {}
+
+    sut.set_cookie("name", "value", partitioned=False)
+    assert str(sut.cookies) == "Set-Cookie: name=value; Path=/"
+
+    sut.set_cookie("name", "value", partitioned=True)
+    assert str(sut.cookies) == "Set-Cookie: name=value; Partitioned; Path=/"
+
+
+def test_sutonse_cookie__issue_del_cookie() -> None:
+    sut = CookieImplementation()
 
     assert sut.cookies == {}
     assert str(sut.cookies) == ""
 
     sut.del_cookie("name")
     expected = (
-        'Set-Cookie: name=("")?; '
+        'Set-Cookie: name=""; '
         "expires=Thu, 01 Jan 1970 00:00:00 GMT; Max-Age=0; Path=/"
     )
-    assert Matches(expected) == str(sut.cookies)
+    assert str(sut.cookies) == expected
 
 
-def test_cookie_set_after_del():
-    sut = helpers.CookieMixin()
+def test_cookie_set_after_del() -> None:
+    sut = CookieImplementation()
 
     sut.del_cookie("name")
     sut.set_cookie("name", "val")
@@ -900,10 +1043,10 @@ def test_cookie_set_after_del():
     assert str(sut.cookies) == expected
 
 
-def test_populate_with_cookies():
-    cookies_mixin = helpers.CookieMixin()
+def test_populate_with_cookies() -> None:
+    cookies_mixin = CookieImplementation()
     cookies_mixin.set_cookie("name", "value")
-    headers = CIMultiDict()
+    headers = CIMultiDict[str]()
 
     helpers.populate_with_cookies(headers, cookies_mixin.cookies)
     assert headers == CIMultiDict({"Set-Cookie": "name=value; Path=/"})
@@ -921,14 +1064,138 @@ def test_populate_with_cookies():
         # OK
         pytest.param(
             "Tue, 08 Oct 2000 00:56:40 GMT",
-            datetime.datetime(2000, 10, 8, 0, 56, 40, tzinfo=datetime.timezone.utc),
+            datetime.datetime(2000, 10, 8, 0, 56, 40, tzinfo=datetime.UTC),
         ),
         # OK (ignore timezone and overwrite to UTC)
         pytest.param(
             "Tue, 08 Oct 2000 00:56:40 +0900",
-            datetime.datetime(2000, 10, 8, 0, 56, 40, tzinfo=datetime.timezone.utc),
+            datetime.datetime(2000, 10, 8, 0, 56, 40, tzinfo=datetime.UTC),
         ),
     ],
 )
-def test_parse_http_date(value, expected):
+def test_parse_http_date(value: str, expected: datetime.datetime | None) -> None:
     assert parse_http_date(value) == expected
+
+
+@pytest.mark.parametrize(
+    ["netrc_contents", "expected_username"],
+    [
+        (
+            "machine example.com login username password pass\n",
+            "username",
+        ),
+    ],
+    indirect=("netrc_contents",),
+)
+@pytest.mark.usefixtures("netrc_contents")
+def test_netrc_from_env(expected_username: str) -> None:
+    """Test that reading netrc files from env works as expected"""
+    netrc_obj = helpers.netrc_from_env()
+    assert netrc_obj is not None
+    auth = netrc_obj.authenticators("example.com")
+    assert auth is not None
+    assert auth[0] == expected_username
+
+
+@pytest.fixture
+def protected_dir(tmp_path: Path) -> Iterator[Path]:
+    protected_dir = tmp_path / "protected"
+    protected_dir.mkdir()
+    try:
+        protected_dir.chmod(0o600)
+        yield protected_dir
+    finally:
+        protected_dir.rmdir()
+
+
+def test_netrc_from_home_does_not_raise_if_access_denied(
+    protected_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(Path, "home", lambda: protected_dir)
+    monkeypatch.delenv("NETRC", raising=False)
+
+    helpers.netrc_from_env()
+
+
+@pytest.mark.parametrize(
+    ["netrc_contents", "expected_header"],
+    [
+        (
+            "machine example.com login username password pass\n",
+            helpers.encode_basic_auth("username", "pass"),
+        ),
+        (
+            "machine example.com account username password pass\n",
+            helpers.encode_basic_auth("username", "pass"),
+        ),
+        (
+            "machine example.com password pass\n",
+            helpers.encode_basic_auth("", "pass"),
+        ),
+    ],
+    indirect=("netrc_contents",),
+)
+@pytest.mark.usefixtures("netrc_contents")
+def test_auth_header_from_netrc(expected_header: str) -> None:
+    """Test that netrc file contents are properly parsed into a header value."""
+    netrc_obj = helpers.netrc_from_env()
+
+    assert expected_header == helpers._auth_header_from_netrc(netrc_obj, "example.com")
+
+
+@pytest.mark.parametrize(
+    ["netrc_contents"],
+    [
+        ("",),
+    ],
+    indirect=("netrc_contents",),
+)
+@pytest.mark.usefixtures("netrc_contents")
+def test_read_auth_header_from_empty_netrc() -> None:
+    """Test that an error is raised if netrc doesn't have an entry for our host"""
+    netrc_obj = helpers.netrc_from_env()
+
+    with pytest.raises(
+        LookupError, match="No entry for example.com found in the `.netrc` file."
+    ):
+        helpers._auth_header_from_netrc(netrc_obj, "example.com")
+
+
+def test_method_must_be_empty_body() -> None:
+    """Test that HEAD is the only method that unequivocally must have an empty body."""
+    assert "HEAD" in EMPTY_BODY_METHODS
+    # CONNECT is only empty on a successful response
+    assert "CONNECT" not in EMPTY_BODY_METHODS
+    # Callers are expected to pass already-normalised (uppercase) methods.
+    assert "head" not in EMPTY_BODY_METHODS
+
+
+def test_should_remove_content_length_is_subset_of_must_be_empty_body() -> None:
+    """Test should_remove_content_length is always a subset of must_be_empty_body."""
+    assert should_remove_content_length("GET", 101) is True
+    assert must_be_empty_body("GET", 101) is True
+
+    assert should_remove_content_length("GET", 102) is True
+    assert must_be_empty_body("GET", 102) is True
+
+    assert should_remove_content_length("GET", 204) is True
+    assert must_be_empty_body("GET", 204) is True
+
+    assert should_remove_content_length("GET", 204) is True
+    assert must_be_empty_body("GET", 204) is True
+
+    assert should_remove_content_length("GET", 200) is False
+    assert must_be_empty_body("GET", 200) is False
+
+    assert should_remove_content_length("HEAD", 200) is False
+    assert must_be_empty_body("HEAD", 200) is True
+
+    # CONNECT is only empty on a successful response
+    assert should_remove_content_length("CONNECT", 200) is True
+    assert must_be_empty_body("CONNECT", 200) is True
+
+    assert should_remove_content_length("CONNECT", 201) is True
+    assert must_be_empty_body("CONNECT", 201) is True
+
+    assert should_remove_content_length("CONNECT", 300) is False
+    assert must_be_empty_body("CONNECT", 300) is False

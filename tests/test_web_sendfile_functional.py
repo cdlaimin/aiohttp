@@ -1,58 +1,119 @@
-# type: ignore
 import asyncio
+import bz2
+import contextlib
+import gzip
 import pathlib
 import socket
-import zlib
-from typing import Any, Iterable
+from collections.abc import AsyncIterator, Iterable
+from typing import Protocol
+from unittest import mock
 
 import pytest
+from _pytest.fixtures import SubRequest
+from pytest_aiohttp import AiohttpClient, AiohttpServer
 
 import aiohttp
 from aiohttp import web
+from aiohttp.compression_utils import ZLibBackend
+from aiohttp.typedefs import PathLike
+from aiohttp.web_fileresponse import NOSENDFILE
+
+try:
+    import brotlicffi as brotli
+except ImportError:
+    try:
+        import brotli
+    except ImportError:
+        brotli = None
 
 try:
     import ssl
 except ImportError:
-    ssl = None
+    ssl = None  # type: ignore[assignment]
+
+try:
+    import aiofastnet
+except ImportError:
+    aiofastnet = None  # type: ignore[assignment]
 
 
-@pytest.fixture
-def loop_without_sendfile(loop: Any):
-    def sendfile(*args, **kwargs):
-        raise NotImplementedError
-
-    loop.sendfile = sendfile
-    return loop
+class _Sender(Protocol):
+    def __call__(
+        self, path: PathLike, chunk_size: int = 256 * 1024
+    ) -> web.FileResponse: ...
 
 
-@pytest.fixture
-def loop_with_mocked_native_sendfile(loop: Any):
-    def sendfile(transport, fobj, offset, count):
-        if count == 0:
-            raise ValueError("count must be a positive integer (got 0)")
-        raise NotImplementedError
+HELLO_AIOHTTP = b"Hello aiohttp! :-)\n"
 
-    loop.sendfile = sendfile
-    return loop
+
+@pytest.fixture(scope="module")
+def hello_txt(
+    request: pytest.FixtureRequest, tmp_path_factory: pytest.TempPathFactory
+) -> pathlib.Path:
+    """Create a temp path with hello.txt and compressed versions.
+
+    The uncompressed text file path is returned by default. Alternatively, an
+    indirect parameter can be passed with an encoding to get a compressed path.
+    """
+    txt = tmp_path_factory.mktemp("hello-") / "hello.txt"
+    hello = {
+        None: txt,
+        "gzip": txt.with_suffix(f"{txt.suffix}.gz"),
+        "br": txt.with_suffix(f"{txt.suffix}.br"),
+        "bzip2": txt.with_suffix(f"{txt.suffix}.bz2"),
+    }
+    # Uncompressed file is not actually written to test it is not required.
+    hello["gzip"].write_bytes(gzip.compress(HELLO_AIOHTTP))
+    if brotli is not None:
+        hello["br"].write_bytes(brotli.compress(HELLO_AIOHTTP))
+    hello["bzip2"].write_bytes(bz2.compress(HELLO_AIOHTTP))
+    encoding = getattr(request, "param", None)
+    if encoding == "br" and brotli is None:
+        pytest.skip("brotli not available")
+    return hello[encoding]
 
 
 @pytest.fixture(params=["sendfile", "no_sendfile"], ids=["sendfile", "no_sendfile"])
-def sender(request: Any, loop_without_sendfile: Any):
-    def maker(*args, **kwargs):
-        ret = web.FileResponse(*args, **kwargs)
-        if request.param == "no_sendfile":
-            asyncio.set_event_loop(loop_without_sendfile)
-        return ret
+async def sender(request: SubRequest) -> AsyncIterator[_Sender]:
+    sendfile_mock = None
 
-    return maker
+    def maker(path: PathLike, chunk_size: int = 256 * 1024) -> web.FileResponse:
+        if request.param == "no_sendfile":
+            if aiofastnet is None:
+                assert asyncio.get_running_loop().sendfile is sendfile_mock  # type: ignore[unreachable, unused-ignore]
+            else:
+                assert aiofastnet.sendfile is sendfile_mock  # type: ignore[unreachable, unused-ignore]
+        return web.FileResponse(path, chunk_size=chunk_size)
+
+    if request.param == "no_sendfile":
+        if aiofastnet is None:
+            with mock.patch.object(  # type: ignore[unreachable, unused-ignore]
+                asyncio.get_running_loop(),
+                "sendfile",
+                autospec=True,
+                spec_set=True,
+                side_effect=NotImplementedError,
+            ) as sendfile_mock:
+                yield maker
+        else:
+            with mock.patch.object(  # type: ignore[unreachable, unused-ignore]
+                aiofastnet,
+                "sendfile",
+                autospec=True,
+                spec_set=True,
+                side_effect=NotImplementedError,
+            ) as sendfile_mock:
+                yield maker
+    else:
+        yield maker
 
 
 @pytest.fixture
-def app_with_static_route(sender: Any) -> web.Application:
+async def app_with_static_route(sender: _Sender) -> web.Application:
     filename = "data.unknown_mime_type"
     filepath = pathlib.Path(__file__).parent / filename
 
-    async def handler(request):
+    async def handler(request: web.Request) -> web.FileResponse:
         return sender(filepath)
 
     app = web.Application()
@@ -61,7 +122,7 @@ def app_with_static_route(sender: Any) -> web.Application:
 
 
 async def test_static_file_ok(
-    aiohttp_client: Any, app_with_static_route: web.Application
+    aiohttp_client: AiohttpClient, app_with_static_route: web.Application
 ) -> None:
     client = await aiohttp_client(app_with_static_route)
 
@@ -71,13 +132,16 @@ async def test_static_file_ok(
     assert "file content" == txt.rstrip()
     assert "application/octet-stream" == resp.headers["Content-Type"]
     assert resp.headers.get("Content-Encoding") is None
-    await resp.release()
+    resp.release()
+    await client.close()
 
 
-async def test_zero_bytes_file_ok(aiohttp_client: Any, sender: Any) -> None:
+async def test_zero_bytes_file_ok(
+    aiohttp_client: AiohttpClient, sender: _Sender
+) -> None:
     filepath = pathlib.Path(__file__).parent / "data.zero_bytes"
 
-    async def handler(request):
+    async def handler(request: web.Request) -> web.FileResponse:
         return sender(filepath)
 
     app = web.Application()
@@ -94,16 +158,17 @@ async def test_zero_bytes_file_ok(aiohttp_client: Any, sender: Any) -> None:
         assert "" == txt.rstrip()
         assert "application/octet-stream" == resp.headers["Content-Type"]
         assert resp.headers.get("Content-Encoding") is None
-        await resp.release()
+        resp.release()
+
+    await client.close()
 
 
 async def test_zero_bytes_file_mocked_native_sendfile(
-    aiohttp_client: Any, loop_with_mocked_native_sendfile: Any
+    aiohttp_client: AiohttpClient,
 ) -> None:
     filepath = pathlib.Path(__file__).parent / "data.zero_bytes"
 
-    async def handler(request):
-        asyncio.set_event_loop(loop_with_mocked_native_sendfile)
+    async def handler(request: web.Request) -> web.FileResponse:
         return web.FileResponse(filepath)
 
     app = web.Application()
@@ -121,11 +186,13 @@ async def test_zero_bytes_file_mocked_native_sendfile(
         assert "application/octet-stream" == resp.headers["Content-Type"]
         assert resp.headers.get("Content-Encoding") is None
         assert resp.headers.get("Content-Length") == "0"
-        await resp.release()
+        resp.release()
+
+    await client.close()
 
 
 async def test_static_file_ok_string_path(
-    aiohttp_client: Any, app_with_static_route: web.Application
+    aiohttp_client: AiohttpClient, app_with_static_route: web.Application
 ) -> None:
     client = await aiohttp_client(app_with_static_route)
 
@@ -135,43 +202,46 @@ async def test_static_file_ok_string_path(
     assert "file content" == txt.rstrip()
     assert "application/octet-stream" == resp.headers["Content-Type"]
     assert resp.headers.get("Content-Encoding") is None
-    await resp.release()
+    resp.release()
+    await client.close()
 
 
-async def test_static_file_not_exists(aiohttp_client: Any) -> None:
-
+async def test_static_file_not_exists(aiohttp_client: AiohttpClient) -> None:
     app = web.Application()
     client = await aiohttp_client(app)
 
     resp = await client.get("/fake")
     assert resp.status == 404
-    await resp.release()
+    resp.release()
+    await client.close()
 
 
-async def test_static_file_name_too_long(aiohttp_client: Any) -> None:
-
+async def test_static_file_name_too_long(aiohttp_client: AiohttpClient) -> None:
     app = web.Application()
     client = await aiohttp_client(app)
 
     resp = await client.get("/x*500")
     assert resp.status == 404
-    await resp.release()
+    resp.release()
+    await client.close()
 
 
-async def test_static_file_upper_directory(aiohttp_client: Any) -> None:
-
+async def test_static_file_upper_directory(aiohttp_client: AiohttpClient) -> None:
     app = web.Application()
     client = await aiohttp_client(app)
 
     resp = await client.get("/../../")
     assert resp.status == 404
-    await resp.release()
+    resp.release()
+    await client.close()
 
 
-async def test_static_file_with_content_type(aiohttp_client: Any, sender: Any) -> None:
+async def test_static_file_with_content_type(
+    aiohttp_client: AiohttpClient, sender: _Sender
+) -> None:
     filepath = pathlib.Path(__file__).parent / "aiohttp.jpg"
 
-    async def handler(request):
+    async def handler(request: web.Request) -> web.FileResponse:
         return sender(filepath, chunk_size=16)
 
     app = web.Application()
@@ -187,15 +257,134 @@ async def test_static_file_with_content_type(aiohttp_client: Any, sender: Any) -
     assert resp.headers["Content-Type"] == "image/jpeg"
     assert resp.headers.get("Content-Encoding") is None
     resp.close()
+    resp.release()
+    await client.close()
 
 
+@pytest.mark.parametrize(
+    ("filename", "charset", "expected_type"),
+    (
+        ("hello.txt", "utf-8", "text/plain; charset=utf-8"),
+        ("hello.html", "UTF-8", "text/html; charset=utf-8"),
+        ("hello.txt", "koi8-r", "text/plain; charset=koi8-r"),
+    ),
+)
+async def test_static_file_charset(
+    aiohttp_client: AiohttpClient,
+    tmp_path: pathlib.Path,
+    filename: str,
+    charset: str,
+    expected_type: str,
+) -> None:
+    """Test that the charset is appended to guessed text/* content types."""
+    file_path = tmp_path / filename
+    file_path.write_bytes(b"Hello")
+
+    async def handler(request: web.Request) -> web.FileResponse:
+        return web.FileResponse(file_path, text_charset=charset)
+
+    app = web.Application()
+    app.router.add_get("/", handler)
+    client = await aiohttp_client(app)
+
+    async with client.get("/") as resp:
+        assert resp.status == 200
+        assert resp.headers["Content-Type"] == expected_type
+
+
+@pytest.mark.parametrize(
+    ("filename", "expected_type"),
+    (
+        ("data.bin", "application/octet-stream"),
+        ("data.json", "application/json"),
+    ),
+)
+async def test_static_file_charset_not_applied_to_non_text(
+    aiohttp_client: AiohttpClient,
+    tmp_path: pathlib.Path,
+    filename: str,
+    expected_type: str,
+) -> None:
+    """Test that the charset is not appended to non-text content types."""
+    file_path = tmp_path / filename
+    file_path.write_bytes(b"data")
+
+    async def handler(request: web.Request) -> web.FileResponse:
+        return web.FileResponse(file_path, text_charset="utf-8")
+
+    app = web.Application()
+    app.router.add_get("/", handler)
+    client = await aiohttp_client(app)
+
+    async with client.get("/") as resp:
+        assert resp.status == 200
+        assert resp.headers["Content-Type"] == expected_type
+
+
+async def test_static_file_charset_keeps_explicit_content_type(
+    aiohttp_client: AiohttpClient, tmp_path: pathlib.Path
+) -> None:
+    """Test that the charset never modifies a user-supplied Content-Type header."""
+    file_path = tmp_path / "hello.txt"
+    file_path.write_bytes(b"Hello")
+
+    async def handler(request: web.Request) -> web.FileResponse:
+        return web.FileResponse(
+            file_path,
+            headers={"Content-Type": "text/plain; charset=latin-1"},
+            text_charset="utf-8",
+        )
+
+    app = web.Application()
+    app.router.add_get("/", handler)
+    client = await aiohttp_client(app)
+
+    async with client.get("/") as resp:
+        assert resp.status == 200
+        assert resp.headers["Content-Type"] == "text/plain; charset=latin-1"
+
+
+async def test_static_route_charset(
+    aiohttp_client: AiohttpClient, tmp_path: pathlib.Path
+) -> None:
+    """Test that add_static passes the charset through to file responses."""
+    (tmp_path / "hello.txt").write_bytes(b"Hello")
+    (tmp_path / "data.bin").write_bytes(b"\x00\x01\x02")
+
+    app = web.Application()
+    app.router.add_static("/static", tmp_path, text_charset="utf-8")
+    client = await aiohttp_client(app)
+
+    async with client.get("/static/hello.txt") as resp:
+        assert resp.status == 200
+        assert resp.headers["Content-Type"] == "text/plain; charset=utf-8"
+
+    async with client.get("/static/data.bin") as resp:
+        assert resp.status == 200
+        assert resp.headers["Content-Type"] == "application/octet-stream"
+
+
+def test_static_file_text_charset_empty() -> None:
+    """Test that an empty text_charset is rejected at construction time."""
+    with pytest.raises(ValueError, match="text_charset"):
+        web.FileResponse(pathlib.Path("hello.txt"), text_charset="")
+
+
+def test_static_route_text_charset_empty(tmp_path: pathlib.Path) -> None:
+    """Test that an empty text_charset is rejected when the route is set up."""
+    app = web.Application()
+    with pytest.raises(ValueError, match="text_charset"):
+        app.router.add_static("/static", tmp_path, text_charset="")
+
+
+@pytest.mark.parametrize("hello_txt", ["gzip", "br"], indirect=True)
 async def test_static_file_custom_content_type(
-    aiohttp_client: Any, sender: Any
+    hello_txt: pathlib.Path, aiohttp_client: AiohttpClient, sender: _Sender
 ) -> None:
-    filepath = pathlib.Path(__file__).parent / "hello.txt.gz"
+    """Test that custom type without encoding is returned for encoded request."""
 
-    async def handler(request):
-        resp = sender(filepath, chunk_size=16)
+    async def handler(request: web.Request) -> web.FileResponse:
+        resp = sender(hello_txt, chunk_size=16)
         resp.content_type = "application/pdf"
         return resp
 
@@ -205,22 +394,31 @@ async def test_static_file_custom_content_type(
 
     resp = await client.get("/")
     assert resp.status == 200
-    body = await resp.read()
-    with filepath.open("rb") as f:
-        content = f.read()
-        assert content == body
-    assert resp.headers["Content-Type"] == "application/pdf"
     assert resp.headers.get("Content-Encoding") is None
+    assert resp.headers["Content-Type"] == "application/pdf"
+    assert await resp.read() == hello_txt.read_bytes()
     resp.close()
+    resp.release()
+    await client.close()
 
 
+@pytest.mark.parametrize(
+    ("accept_encoding", "expect_encoding"),
+    [("gzip, deflate", "gzip"), ("gzip, deflate, br", "br")],
+)
 async def test_static_file_custom_content_type_compress(
-    aiohttp_client: Any, sender: Any
-):
-    filepath = pathlib.Path(__file__).parent / "hello.txt"
+    hello_txt: pathlib.Path,
+    aiohttp_client: AiohttpClient,
+    sender: _Sender,
+    accept_encoding: str,
+    expect_encoding: str,
+) -> None:
+    """Test that custom type with encoding is returned for unencoded requests."""
+    if expect_encoding == "br" and brotli is None:
+        pytest.skip("brotli not available")
 
-    async def handler(request):
-        resp = sender(filepath, chunk_size=16)
+    async def handler(request: web.Request) -> web.FileResponse:
+        resp = sender(hello_txt, chunk_size=16)
         resp.content_type = "application/pdf"
         return resp
 
@@ -228,40 +426,90 @@ async def test_static_file_custom_content_type_compress(
     app.router.add_get("/", handler)
     client = await aiohttp_client(app)
 
-    resp = await client.get("/")
+    resp = await client.get("/", headers={"Accept-Encoding": accept_encoding})
     assert resp.status == 200
-    body = await resp.read()
-    assert b"hello aiohttp\n" == body
+    assert resp.headers.get("Content-Encoding") == expect_encoding
     assert resp.headers["Content-Type"] == "application/pdf"
-    assert resp.headers.get("Content-Encoding") == "gzip"
+    assert await resp.read() == HELLO_AIOHTTP
     resp.close()
+    resp.release()
+    await client.close()
 
 
-async def test_static_file_with_content_encoding(
-    aiohttp_client: Any, sender: Any
+@pytest.mark.parametrize(
+    ("accept_encoding", "expect_encoding"),
+    [("gzip, deflate", "gzip"), ("gzip, deflate, br", "br")],
+)
+@pytest.mark.parametrize("forced_compression", [None, web.ContentCoding.gzip])
+@pytest.mark.usefixtures("parametrize_zlib_backend")
+async def test_static_file_with_encoding_and_enable_compression(
+    hello_txt: pathlib.Path,
+    aiohttp_client: AiohttpClient,
+    sender: _Sender,
+    accept_encoding: str,
+    expect_encoding: str,
+    forced_compression: web.ContentCoding | None,
 ) -> None:
-    filepath = pathlib.Path(__file__).parent / "hello.txt.gz"
+    """Test that enable_compression does not double compress when an encoded file is also present."""
+    if expect_encoding == "br" and brotli is None:
+        pytest.skip("brotli not available")
 
-    async def handler(request):
-        return sender(filepath)
+    async def handler(request: web.Request) -> web.FileResponse:
+        resp = sender(hello_txt)
+        resp.enable_compression(forced_compression)
+        return resp
+
+    app = web.Application()
+    app.router.add_get("/", handler)
+    client = await aiohttp_client(app)
+
+    resp = await client.get("/", headers={"Accept-Encoding": accept_encoding})
+    assert resp.status == 200
+    assert resp.headers.get("Content-Encoding") == expect_encoding
+    assert resp.headers["Content-Type"] == "text/plain"
+    assert await resp.read() == HELLO_AIOHTTP
+    resp.close()
+    resp.release()
+    await client.close()
+
+
+@pytest.mark.parametrize(
+    ("hello_txt", "expect_type"),
+    [
+        ("gzip", "application/gzip"),
+        ("br", "application/x-brotli"),
+        ("bzip2", "application/x-bzip2"),
+    ],
+    indirect=["hello_txt"],
+)
+async def test_static_file_with_content_encoding(
+    hello_txt: pathlib.Path,
+    aiohttp_client: AiohttpClient,
+    sender: _Sender,
+    expect_type: str,
+) -> None:
+    """Test requesting static compressed files returns the correct content type and encoding."""
+
+    async def handler(request: web.Request) -> web.FileResponse:
+        return sender(hello_txt)
 
     app = web.Application()
     app.router.add_get("/", handler)
     client = await aiohttp_client(app)
 
     resp = await client.get("/")
-    assert 200 == resp.status
-    body = await resp.read()
-    assert b"hello aiohttp\n" == body
-    ct = resp.headers["CONTENT-TYPE"]
-    assert "text/plain" == ct
-    encoding = resp.headers["CONTENT-ENCODING"]
-    assert "gzip" == encoding
+    assert resp.status == 200
+    assert resp.headers.get("Content-Encoding") is None
+    assert resp.headers["Content-Type"] == expect_type
+    assert await resp.read() == hello_txt.read_bytes()
     resp.close()
+
+    resp.release()
+    await client.close()
 
 
 async def test_static_file_if_modified_since(
-    aiohttp_client: Any, app_with_static_route: web.Application
+    aiohttp_client: AiohttpClient, app_with_static_route: web.Application
 ) -> None:
     client = await aiohttp_client(app_with_static_route)
 
@@ -270,6 +518,7 @@ async def test_static_file_if_modified_since(
     lastmod = resp.headers.get("Last-Modified")
     assert lastmod is not None
     resp.close()
+    resp.release()
 
     resp = await client.get("/", headers={"If-Modified-Since": lastmod})
     body = await resp.read()
@@ -278,10 +527,12 @@ async def test_static_file_if_modified_since(
     assert resp.headers.get("Last-Modified") == lastmod
     assert b"" == body
     resp.close()
+    resp.release()
+    await client.close()
 
 
 async def test_static_file_if_modified_since_past_date(
-    aiohttp_client: Any, app_with_static_route: web.Application
+    aiohttp_client: AiohttpClient, app_with_static_route: web.Application
 ) -> None:
     client = await aiohttp_client(app_with_static_route)
 
@@ -291,10 +542,13 @@ async def test_static_file_if_modified_since_past_date(
     assert 200 == resp.status
     resp.close()
 
+    resp.release()
+    await client.close()
+
 
 async def test_static_file_if_modified_since_invalid_date(
-    aiohttp_client: Any, app_with_static_route: web.Application
-):
+    aiohttp_client: AiohttpClient, app_with_static_route: web.Application
+) -> None:
     client = await aiohttp_client(app_with_static_route)
 
     lastmod = "not a valid HTTP-date"
@@ -303,10 +557,13 @@ async def test_static_file_if_modified_since_invalid_date(
     assert 200 == resp.status
     resp.close()
 
+    resp.release()
+    await client.close()
+
 
 async def test_static_file_if_modified_since_future_date(
-    aiohttp_client: Any, app_with_static_route: web.Application
-):
+    aiohttp_client: AiohttpClient, app_with_static_route: web.Application
+) -> None:
     client = await aiohttp_client(app_with_static_route)
 
     lastmod = "Fri, 31 Dec 9999 23:59:59 GMT"
@@ -319,10 +576,13 @@ async def test_static_file_if_modified_since_future_date(
     assert b"" == body
     resp.close()
 
+    resp.release()
+    await client.close()
+
 
 @pytest.mark.parametrize("if_unmodified_since", ("", "Fri, 31 Dec 0000 23:59:59 GMT"))
 async def test_static_file_if_match(
-    aiohttp_client: Any,
+    aiohttp_client: AiohttpClient,
     app_with_static_route: web.Application,
     if_unmodified_since: str,
 ) -> None:
@@ -334,6 +594,7 @@ async def test_static_file_if_match(
 
     assert original_etag is not None
     resp.close()
+    resp.release()
 
     headers = {"If-Match": original_etag, "If-Unmodified-Since": if_unmodified_since}
     resp = await client.head("/", headers=headers)
@@ -343,6 +604,9 @@ async def test_static_file_if_match(
     assert resp.headers.get("Last-Modified")
     assert b"" == body
     resp.close()
+    resp.release()
+
+    await client.close()
 
 
 @pytest.mark.parametrize("if_unmodified_since", ("", "Fri, 31 Dec 0000 23:59:59 GMT"))
@@ -354,11 +618,11 @@ async def test_static_file_if_match(
     ],
 )
 async def test_static_file_if_match_custom_tags(
-    aiohttp_client: Any,
+    aiohttp_client: AiohttpClient,
     app_with_static_route: web.Application,
     if_unmodified_since: str,
-    etags: Iterable[str],
-    expected_status: Iterable[int],
+    etags: tuple[str],
+    expected_status: int,
 ) -> None:
     client = await aiohttp_client(app_with_static_route)
 
@@ -370,6 +634,9 @@ async def test_static_file_if_match_custom_tags(
     assert b"" == body
     resp.close()
 
+    resp.release()
+    await client.close()
+
 
 @pytest.mark.parametrize("if_modified_since", ("", "Fri, 31 Dec 9999 23:59:59 GMT"))
 @pytest.mark.parametrize(
@@ -380,7 +647,7 @@ async def test_static_file_if_match_custom_tags(
     ),
 )
 async def test_static_file_if_none_match(
-    aiohttp_client: Any,
+    aiohttp_client: AiohttpClient,
     app_with_static_route: web.Application,
     if_modified_since: str,
     additional_etags: Iterable[str],
@@ -389,11 +656,11 @@ async def test_static_file_if_none_match(
 
     resp = await client.get("/")
     assert 200 == resp.status
-    original_etag = resp.headers.get("ETag")
+    original_etag = resp.headers["ETag"]
 
     assert resp.headers.get("Last-Modified") is not None
-    assert original_etag is not None
     resp.close()
+    resp.release()
 
     etag = ",".join((original_etag, *additional_etags))
 
@@ -406,10 +673,13 @@ async def test_static_file_if_none_match(
     assert resp.headers.get("ETag") == original_etag
     assert b"" == body
     resp.close()
+    resp.release()
+
+    await client.close()
 
 
 async def test_static_file_if_none_match_star(
-    aiohttp_client: Any,
+    aiohttp_client: AiohttpClient,
     app_with_static_route: web.Application,
 ) -> None:
     client = await aiohttp_client(app_with_static_route)
@@ -423,21 +693,56 @@ async def test_static_file_if_none_match_star(
     assert b"" == body
     resp.close()
 
+    resp.release()
+    await client.close()
 
-@pytest.mark.skipif(not ssl, reason="ssl not supported")
+
+@pytest.mark.parametrize("if_modified_since", ("", "Fri, 31 Dec 9999 23:59:59 GMT"))
+async def test_static_file_if_none_match_weak(
+    aiohttp_client: AiohttpClient,
+    app_with_static_route: web.Application,
+    if_modified_since: str,
+) -> None:
+    client = await aiohttp_client(app_with_static_route)
+
+    resp = await client.get("/")
+    assert 200 == resp.status
+    original_etag = resp.headers["ETag"]
+
+    assert resp.headers.get("Last-Modified") is not None
+    resp.close()
+    resp.release()
+
+    weak_etag = f"W/{original_etag}"
+
+    resp = await client.get(
+        "/",
+        headers={"If-None-Match": weak_etag, "If-Modified-Since": if_modified_since},
+    )
+    body = await resp.read()
+    assert 304 == resp.status
+    assert resp.headers.get("Content-Length") is None
+    assert resp.headers.get("ETag") == original_etag
+    assert b"" == body
+    resp.close()
+    resp.release()
+
+    await client.close()
+
+
+@pytest.mark.skipif(ssl is None, reason="ssl not supported")
 async def test_static_file_ssl(
-    aiohttp_server: Any,
-    ssl_ctx: Any,
-    aiohttp_client: Any,
-    client_ssl_ctx: Any,
+    aiohttp_server: AiohttpServer,
+    ssl_ctx: ssl.SSLContext,
+    aiohttp_client: AiohttpClient,
+    client_ssl_ctx: ssl.SSLContext,
 ) -> None:
     dirname = pathlib.Path(__file__).parent
     filename = "data.unknown_mime_type"
     app = web.Application()
     app.router.add_static("/static", dirname)
     server = await aiohttp_server(app, ssl=ssl_ctx)
-    conn = aiohttp.TCPConnector(ssl=client_ssl_ctx)
-    client = await aiohttp_client(server, connector=conn)
+    client = await aiohttp_client(server, ssl=client_ssl_ctx)  # type: ignore[var-annotated]
 
     resp = await client.get("/static/" + filename)
     assert 200 == resp.status
@@ -447,8 +752,13 @@ async def test_static_file_ssl(
     assert "application/octet-stream" == ct
     assert resp.headers.get("CONTENT-ENCODING") is None
 
+    resp.release()
+    await client.close()
 
-async def test_static_file_directory_traversal_attack(aiohttp_client: Any) -> None:
+
+async def test_static_file_directory_traversal_attack(
+    aiohttp_client: AiohttpClient,
+) -> None:
     dirname = pathlib.Path(__file__).parent
     relpath = "../README.rst"
     full_path = dirname / relpath
@@ -460,26 +770,25 @@ async def test_static_file_directory_traversal_attack(aiohttp_client: Any) -> No
 
     resp = await client.get("/static/" + relpath)
     assert 404 == resp.status
+    resp.release()
 
     url_relpath2 = "/static/dir/../" + relpath
     resp = await client.get(url_relpath2)
     assert 404 == resp.status
+    resp.release()
 
     url_abspath = "/static/" + str(full_path.resolve())
     resp = await client.get(url_abspath)
-    assert 403 == resp.status
+    assert resp.status == 404
+    resp.release()
+
+    await client.close()
 
 
-def test_static_route_path_existence_check() -> None:
-    directory = pathlib.Path(__file__).parent
-    web.StaticResource("/", directory)
-
-    nodirectory = directory / "nonexistent-uPNiOEAg5d"
-    with pytest.raises(ValueError):
-        web.StaticResource("/", nodirectory)
-
-
-async def test_static_file_huge(aiohttp_client: Any, tmp_path: Any) -> None:
+@pytest.mark.skip_blockbuster
+async def test_static_file_huge(
+    aiohttp_client: AiohttpClient, tmp_path: pathlib.Path
+) -> None:
     file_path = tmp_path / "huge_data.unknown_mime_type"
 
     # fill 20MB file
@@ -498,26 +807,31 @@ async def test_static_file_huge(aiohttp_client: Any, tmp_path: Any) -> None:
     ct = resp.headers["CONTENT-TYPE"]
     assert "application/octet-stream" == ct
     assert resp.headers.get("CONTENT-ENCODING") is None
-    assert int(resp.headers.get("CONTENT-LENGTH")) == file_st.st_size
+    assert int(resp.headers["CONTENT-LENGTH"]) == file_st.st_size
 
-    f = file_path.open("rb")
+    f2 = file_path.open("rb")
     off = 0
     cnt = 0
     while off < file_st.st_size:
         chunk = await resp.content.readany()
-        expected = f.read(len(chunk))
+        expected = f2.read(len(chunk))
         assert chunk == expected
         off += len(chunk)
         cnt += 1
-    f.close()
+    f2.close()
+
+    resp.release()
+    await client.close()
 
 
-async def test_static_file_range(aiohttp_client: Any, sender: Any) -> None:
+async def test_static_file_range(
+    aiohttp_client: AiohttpClient, sender: _Sender
+) -> None:
     filepath = pathlib.Path(__file__).parent / "sample.txt"
 
     filesize = filepath.stat().st_size
 
-    async def handler(request):
+    async def handler(request: web.Request) -> web.FileResponse:
         return sender(filepath, chunk_size=16)
 
     app = web.Application()
@@ -535,18 +849,18 @@ async def test_static_file_range(aiohttp_client: Any, sender: Any) -> None:
     )
     assert len(responses) == 3
     assert responses[0].status == 206, "failed 'bytes=0-999': %s" % responses[0].reason
-    assert responses[0].headers["Content-Range"] == "bytes 0-999/{}".format(
-        filesize
+    assert (
+        responses[0].headers["Content-Range"] == f"bytes 0-999/{filesize}"
     ), "failed: Content-Range Error"
     assert responses[1].status == 206, (
         "failed 'bytes=1000-1999': %s" % responses[1].reason
     )
-    assert responses[1].headers["Content-Range"] == "bytes 1000-1999/{}".format(
-        filesize
+    assert (
+        responses[1].headers["Content-Range"] == f"bytes 1000-1999/{filesize}"
     ), "failed: Content-Range Error"
     assert responses[2].status == 206, "failed 'bytes=2000-': %s" % responses[2].reason
-    assert responses[2].headers["Content-Range"] == "bytes 2000-{}/{}".format(
-        filesize - 1, filesize
+    assert (
+        responses[2].headers["Content-Range"] == f"bytes 2000-{filesize - 1}/{filesize}"
     ), "failed: Content-Range Error"
 
     body = await asyncio.gather(
@@ -563,13 +877,20 @@ async def test_static_file_range(aiohttp_client: Any, sender: Any) -> None:
     responses[1].close()
     responses[2].close()
 
+    for resp in responses:
+        resp.release()
+
     assert content == b"".join(body)
 
+    await client.close()
 
-async def test_static_file_range_end_bigger_than_size(aiohttp_client: Any, sender: Any):
+
+async def test_static_file_range_end_bigger_than_size(
+    aiohttp_client: AiohttpClient, sender: _Sender
+) -> None:
     filepath = pathlib.Path(__file__).parent / "aiohttp.png"
 
-    async def handler(request):
+    async def handler(request: web.Request) -> web.FileResponse:
         return sender(filepath, chunk_size=16)
 
     app = web.Application()
@@ -596,11 +917,16 @@ async def test_static_file_range_end_bigger_than_size(aiohttp_client: Any, sende
 
         assert content[54000:] == body
 
+    response.release()
+    await client.close()
 
-async def test_static_file_range_beyond_eof(aiohttp_client: Any, sender: Any) -> None:
+
+async def test_static_file_range_beyond_eof(
+    aiohttp_client: AiohttpClient, sender: _Sender
+) -> None:
     filepath = pathlib.Path(__file__).parent / "aiohttp.png"
 
-    async def handler(request):
+    async def handler(request: web.Request) -> web.FileResponse:
         return sender(filepath, chunk_size=16)
 
     app = web.Application()
@@ -614,11 +940,16 @@ async def test_static_file_range_beyond_eof(aiohttp_client: Any, sender: Any) ->
         "failed 'bytes=1000000-1200000': %s" % response.reason
     )
 
+    response.release()
+    await client.close()
 
-async def test_static_file_range_tail(aiohttp_client: Any, sender: Any) -> None:
+
+async def test_static_file_range_tail(
+    aiohttp_client: AiohttpClient, sender: _Sender
+) -> None:
     filepath = pathlib.Path(__file__).parent / "aiohttp.png"
 
-    async def handler(request):
+    async def handler(request: web.Request) -> web.FileResponse:
         return sender(filepath, chunk_size=16)
 
     app = web.Application()
@@ -636,6 +967,7 @@ async def test_static_file_range_tail(aiohttp_client: Any, sender: Any) -> None:
     ), "failed: Content-Range Error"
     body4 = await resp.read()
     resp.close()
+    resp.release()
     assert content[-500:] == body4
 
     # Ensure out-of-range tails could be handled
@@ -644,12 +976,17 @@ async def test_static_file_range_tail(aiohttp_client: Any, sender: Any) -> None:
     assert (
         resp2.headers["Content-Range"] == "bytes 0-54996/54997"
     ), "failed: Content-Range Error"
+    resp2.release()
+
+    await client.close()
 
 
-async def test_static_file_invalid_range(aiohttp_client: Any, sender: Any) -> None:
+async def test_static_file_invalid_range(
+    aiohttp_client: AiohttpClient, sender: _Sender
+) -> None:
     filepath = pathlib.Path(__file__).parent / "aiohttp.png"
 
-    async def handler(request):
+    async def handler(request: web.Request) -> web.FileResponse:
         return sender(filepath, chunk_size=16)
 
     app = web.Application()
@@ -660,36 +997,44 @@ async def test_static_file_invalid_range(aiohttp_client: Any, sender: Any) -> No
     resp = await client.get("/", headers={"Range": "blocks=0-10"})
     assert resp.status == 416, "Range must be in bytes"
     resp.close()
+    resp.release()
 
     # start > end
     resp = await client.get("/", headers={"Range": "bytes=100-0"})
     assert resp.status == 416, "Range start can't be greater than end"
     resp.close()
+    resp.release()
 
     # start > end
     resp = await client.get("/", headers={"Range": "bytes=10-9"})
     assert resp.status == 416, "Range start can't be greater than end"
     resp.close()
+    resp.release()
 
     # non-number range
     resp = await client.get("/", headers={"Range": "bytes=a-f"})
     assert resp.status == 416, "Range must be integers"
     resp.close()
+    resp.release()
 
     # double dash range
     resp = await client.get("/", headers={"Range": "bytes=0--10"})
     assert resp.status == 416, "double dash in range"
     resp.close()
+    resp.release()
 
     # no range
     resp = await client.get("/", headers={"Range": "bytes=-"})
     assert resp.status == 416, "no range given"
     resp.close()
+    resp.release()
+
+    await client.close()
 
 
 async def test_static_file_if_unmodified_since_past_with_range(
-    aiohttp_client: Any, app_with_static_route: web.Application
-):
+    aiohttp_client: AiohttpClient, app_with_static_route: web.Application
+) -> None:
     client = await aiohttp_client(app_with_static_route)
 
     lastmod = "Mon, 1 Jan 1990 01:01:01 GMT"
@@ -699,11 +1044,14 @@ async def test_static_file_if_unmodified_since_past_with_range(
     )
     assert 412 == resp.status
     resp.close()
+    resp.release()
+
+    await client.close()
 
 
 async def test_static_file_if_unmodified_since_future_with_range(
-    aiohttp_client: Any, app_with_static_route: web.Application
-):
+    aiohttp_client: AiohttpClient, app_with_static_route: web.Application
+) -> None:
     client = await aiohttp_client(app_with_static_route)
 
     lastmod = "Fri, 31 Dec 9999 23:59:59 GMT"
@@ -715,11 +1063,14 @@ async def test_static_file_if_unmodified_since_future_with_range(
     assert resp.headers["Content-Range"] == "bytes 2-12/13"
     assert resp.headers["Content-Length"] == "11"
     resp.close()
+    resp.release()
+
+    await client.close()
 
 
 async def test_static_file_if_range_past_with_range(
-    aiohttp_client: Any, app_with_static_route: web.Application
-):
+    aiohttp_client: AiohttpClient, app_with_static_route: web.Application
+) -> None:
     client = await aiohttp_client(app_with_static_route)
 
     lastmod = "Mon, 1 Jan 1990 01:01:01 GMT"
@@ -728,25 +1079,82 @@ async def test_static_file_if_range_past_with_range(
     assert 200 == resp.status
     assert resp.headers["Content-Length"] == "13"
     resp.close()
+    resp.release()
+    await client.close()
 
 
-async def test_static_file_if_range_future_with_range(
-    aiohttp_client: Any, app_with_static_route: web.Application
-):
+async def test_static_file_if_range_matching_date_with_range(
+    aiohttp_client: AiohttpClient, app_with_static_route: web.Application
+) -> None:
     client = await aiohttp_client(app_with_static_route)
 
-    lastmod = "Fri, 31 Dec 9999 23:59:59 GMT"
+    async with client.get("/") as resp:
+        assert 200 == resp.status
+        last_modified = resp.headers["Last-Modified"]
 
-    resp = await client.get("/", headers={"If-Range": lastmod, "Range": "bytes=2-"})
-    assert 206 == resp.status
-    assert resp.headers["Content-Range"] == "bytes 2-12/13"
-    assert resp.headers["Content-Length"] == "11"
-    resp.close()
+    async with client.get(
+        "/", headers={"If-Range": last_modified, "Range": "bytes=2-"}
+    ) as resp:
+        assert 206 == resp.status
+        assert resp.headers["Content-Range"] == "bytes 2-12/13"
+        assert resp.headers["Content-Length"] == "11"
+
+
+async def test_static_file_if_range_etag_match_with_range(
+    aiohttp_client: AiohttpClient, app_with_static_route: web.Application
+) -> None:
+    client = await aiohttp_client(app_with_static_route)
+
+    async with client.get("/") as resp:
+        assert 200 == resp.status
+        etag = resp.headers["ETag"]
+
+    async with client.get("/", headers={"If-Range": etag, "Range": "bytes=2-"}) as resp:
+        assert 206 == resp.status
+        assert resp.headers["Content-Range"] == "bytes 2-12/13"
+        assert resp.headers["Content-Length"] == "11"
+
+
+async def test_static_file_if_range_stale_etag_with_range(
+    aiohttp_client: AiohttpClient, app_with_static_route: web.Application
+) -> None:
+    client = await aiohttp_client(app_with_static_route)
+
+    async with client.get(
+        "/", headers={"If-Range": '"stale-etag"', "Range": "bytes=2-"}
+    ) as resp:
+        assert 200 == resp.status
+        assert resp.headers["Content-Length"] == "13"
+        assert "Content-Range" not in resp.headers
+
+
+@pytest.mark.parametrize(
+    "if_range",
+    ("{etag}", '"{etag}', '"{etag}", "{etag}"', "not a valid HTTP-date"),
+    ids=("unquoted", "unterminated", "list", "date"),
+)
+async def test_static_file_if_range_malformed_with_range(
+    aiohttp_client: AiohttpClient,
+    app_with_static_route: web.Application,
+    if_range: str,
+) -> None:
+    client = await aiohttp_client(app_with_static_route)
+
+    async with client.get("/") as resp:
+        assert 200 == resp.status
+        etag = resp.headers["ETag"].strip('"')
+
+    async with client.get(
+        "/", headers={"If-Range": if_range.format(etag=etag), "Range": "bytes=2-"}
+    ) as resp:
+        assert 200 == resp.status
+        assert resp.headers["Content-Length"] == "13"
+        assert "Content-Range" not in resp.headers
 
 
 async def test_static_file_if_unmodified_since_past_without_range(
-    aiohttp_client: Any, app_with_static_route: web.Application
-):
+    aiohttp_client: AiohttpClient, app_with_static_route: web.Application
+) -> None:
     client = await aiohttp_client(app_with_static_route)
 
     lastmod = "Mon, 1 Jan 1990 01:01:01 GMT"
@@ -755,10 +1163,13 @@ async def test_static_file_if_unmodified_since_past_without_range(
     assert 412 == resp.status
     resp.close()
 
+    resp.release()
+    await client.close()
+
 
 async def test_static_file_if_unmodified_since_future_without_range(
-    aiohttp_client: Any, app_with_static_route: web.Application
-):
+    aiohttp_client: AiohttpClient, app_with_static_route: web.Application
+) -> None:
     client = await aiohttp_client(app_with_static_route)
 
     lastmod = "Fri, 31 Dec 9999 23:59:59 GMT"
@@ -768,10 +1179,13 @@ async def test_static_file_if_unmodified_since_future_without_range(
     assert resp.headers["Content-Length"] == "13"
     resp.close()
 
+    resp.release()
+    await client.close()
+
 
 async def test_static_file_if_range_past_without_range(
-    aiohttp_client: Any, app_with_static_route: web.Application
-):
+    aiohttp_client: AiohttpClient, app_with_static_route: web.Application
+) -> None:
     client = await aiohttp_client(app_with_static_route)
 
     lastmod = "Mon, 1 Jan 1990 01:01:01 GMT"
@@ -781,10 +1195,13 @@ async def test_static_file_if_range_past_without_range(
     assert resp.headers["Content-Length"] == "13"
     resp.close()
 
+    resp.release()
+    await client.close()
+
 
 async def test_static_file_if_range_future_without_range(
-    aiohttp_client: Any, app_with_static_route: web.Application
-):
+    aiohttp_client: AiohttpClient, app_with_static_route: web.Application
+) -> None:
     client = await aiohttp_client(app_with_static_route)
 
     lastmod = "Fri, 31 Dec 9999 23:59:59 GMT"
@@ -794,10 +1211,13 @@ async def test_static_file_if_range_future_without_range(
     assert resp.headers["Content-Length"] == "13"
     resp.close()
 
+    resp.release()
+    await client.close()
+
 
 async def test_static_file_if_unmodified_since_invalid_date(
-    aiohttp_client: Any, app_with_static_route: web.Application
-):
+    aiohttp_client: AiohttpClient, app_with_static_route: web.Application
+) -> None:
     client = await aiohttp_client(app_with_static_route)
 
     lastmod = "not a valid HTTP-date"
@@ -806,10 +1226,13 @@ async def test_static_file_if_unmodified_since_invalid_date(
     assert 200 == resp.status
     resp.close()
 
+    resp.release()
+    await client.close()
+
 
 async def test_static_file_if_range_invalid_date(
-    aiohttp_client: Any, app_with_static_route: web.Application
-):
+    aiohttp_client: AiohttpClient, app_with_static_route: web.Application
+) -> None:
     client = await aiohttp_client(app_with_static_route)
 
     lastmod = "not a valid HTTP-date"
@@ -817,12 +1240,19 @@ async def test_static_file_if_range_invalid_date(
     resp = await client.get("/", headers={"If-Range": lastmod})
     assert 200 == resp.status
     resp.close()
+    resp.release()
+
+    await client.close()
 
 
-async def test_static_file_compression(aiohttp_client: Any, sender: Any) -> None:
+@pytest.mark.usefixtures("parametrize_zlib_backend")
+async def test_static_file_compression(
+    aiohttp_client: AiohttpClient,
+    sender: _Sender,
+) -> None:
     filepath = pathlib.Path(__file__).parent / "data.unknown_mime_type"
 
-    async def handler(request):
+    async def handler(request: web.Request) -> web.FileResponse:
         ret = sender(filepath)
         ret.enable_compression()
         return ret
@@ -833,15 +1263,20 @@ async def test_static_file_compression(aiohttp_client: Any, sender: Any) -> None
 
     resp = await client.get("/")
     assert resp.status == 200
-    zcomp = zlib.compressobj(wbits=zlib.MAX_WBITS)
+    zcomp = ZLibBackend.compressobj(wbits=ZLibBackend.MAX_WBITS)
     expected_body = zcomp.compress(b"file content\n") + zcomp.flush()
     assert expected_body == await resp.read()
     assert "application/octet-stream" == resp.headers["Content-Type"]
     assert resp.headers.get("Content-Encoding") == "deflate"
-    await resp.release()
+    resp.release()
+
+    await client.close()
 
 
-async def test_static_file_huge_cancel(aiohttp_client: Any, tmp_path: Any) -> None:
+@pytest.mark.skip_blockbuster
+async def test_static_file_huge_cancel(
+    aiohttp_client: AiohttpClient, tmp_path: pathlib.Path
+) -> None:
     file_path = tmp_path / "huge_data.unknown_mime_type"
 
     # fill 100MB file
@@ -851,11 +1286,12 @@ async def test_static_file_huge_cancel(aiohttp_client: Any, tmp_path: Any) -> No
 
     task = None
 
-    async def handler(request):
+    async def handler(request: web.Request) -> web.FileResponse:
         nonlocal task
         task = request.task
         # reduce send buffer size
         tr = request.transport
+        assert tr is not None
         sock = tr.get_extra_info("socket")
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1024)
         ret = web.FileResponse(file_path)
@@ -868,6 +1304,7 @@ async def test_static_file_huge_cancel(aiohttp_client: Any, tmp_path: Any) -> No
 
     resp = await client.get("/")
     assert resp.status == 200
+    assert task is not None
     task.cancel()
     await asyncio.sleep(0)
     data = b""
@@ -878,8 +1315,13 @@ async def test_static_file_huge_cancel(aiohttp_client: Any, tmp_path: Any) -> No
             break
     assert len(data) < 1024 * 1024 * 20
 
+    resp.release()
+    await client.close()
 
-async def test_static_file_huge_error(aiohttp_client: Any, tmp_path: Any) -> None:
+
+async def test_static_file_huge_error(
+    aiohttp_client: AiohttpClient, tmp_path: pathlib.Path
+) -> None:
     file_path = tmp_path / "huge_data.unknown_mime_type"
 
     # fill 20MB file
@@ -887,9 +1329,10 @@ async def test_static_file_huge_error(aiohttp_client: Any, tmp_path: Any) -> Non
         f.seek(20 * 1024 * 1024)
         f.write(b"1")
 
-    async def handler(request):
+    async def handler(request: web.Request) -> web.FileResponse:
         # reduce send buffer size
         tr = request.transport
+        assert tr is not None
         sock = tr.get_extra_info("socket")
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1024)
         ret = web.FileResponse(file_path)
@@ -904,3 +1347,67 @@ async def test_static_file_huge_error(aiohttp_client: Any, tmp_path: Any) -> Non
     assert resp.status == 200
     # raise an exception on server side
     resp.close()
+
+    resp.release()
+    await client.close()
+
+
+@pytest.mark.skipif(NOSENDFILE, reason="OS sendfile not available")
+async def test_sendfile_after_client_disconnect(
+    aiohttp_client: AiohttpClient, tmp_path: pathlib.Path
+) -> None:
+    """Test ConnectionResetError when client disconnects before sendfile.
+
+    Reproduces the race condition where:
+    - Client sends a GET request for a file
+    - Handler does async work (e.g. auth check) before returning a FileResponse
+    - Client disconnects while the handler is busy
+    - Server then calls sendfile() → ConnectionResetError (not AssertionError)
+
+    _send_headers_immediately is set to False so that super().prepare()
+    only buffers the headers without writing to the transport. Otherwise
+    _write() raises ClientConnectionResetError first and _sendfile()'s own
+    transport check is never reached.
+    """
+    filepath = tmp_path / "test.txt"
+    filepath.write_bytes(b"x" * 1024)
+
+    handler_started = asyncio.Event()
+    prepare_done = asyncio.Event()
+    captured_protocol = None
+
+    async def handler(request: web.Request) -> web.Response:
+        nonlocal captured_protocol
+        resp = web.FileResponse(filepath)
+        resp._send_headers_immediately = False
+        captured_protocol = request._protocol
+        handler_started.set()
+        # Simulate async work (e.g., auth check) during which client disconnects.
+        await asyncio.sleep(0)
+        with pytest.raises(ConnectionResetError, match="Connection lost"):
+            await resp.prepare(request)
+        prepare_done.set()
+        return web.Response(status=503)
+
+    app = web.Application()
+    app.router.add_get("/", handler)
+    client = await aiohttp_client(app)
+
+    request_task = asyncio.create_task(client.get("/"))
+
+    # Wait until the handler is running but has not yet returned the response.
+    await handler_started.wait()
+    assert captured_protocol is not None
+
+    # Simulate the client disconnecting by setting transport to None directly.
+    # We cannot use force_close() because closing the TCP transport triggers
+    # connection_lost() which cancels the handler task before it can call
+    # prepare() and hit the ConnectionResetError in _sendfile().
+    captured_protocol.transport = None
+
+    # Wait for the handler to resume, call prepare(), and hit ConnectionResetError.
+    await asyncio.wait_for(prepare_done.wait(), timeout=1)
+
+    request_task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await request_task

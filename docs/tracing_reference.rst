@@ -21,23 +21,20 @@ A request goes through the following stages and corresponding fallbacks.
 Overview
 ^^^^^^^^
 
-.. blockdiag::
-   :desctable:
+.. graphviz::
 
+   digraph {
 
-   blockdiag {
-     orientation = portrait;
+     start[shape=point, xlabel="start", width="0.1"];
+     redirect[shape=box];
+     end[shape=point, xlabel="end  ", width="0.1"];
+     exception[shape=oval];
 
-     start[shape=beginpoint, description="on_request_start"];
-     redirect[description="on_request_redirect"];
-     end[shape=endpoint, description="on_request_end"];
-     exception[shape=flowchart.terminator, description="on_request_exception"];
-
-     acquire_connection[description="Connection acquiring"];
-     headers_received;
-     headers_sent[description="on_request_headers_sent"];
-     chunk_sent[description="on_request_chunk_sent"];
-     chunk_received[description="on_response_chunk_received"];
+     acquire_connection[shape=box];
+     headers_received[shape=box];
+     headers_sent[shape=box];
+     chunk_sent[shape=box];
+     chunk_received[shape=box];
 
      start -> acquire_connection;
      acquire_connection -> headers_sent;
@@ -57,28 +54,48 @@ Overview
 
    }
 
+.. list-table::
+   :header-rows: 1
+
+   * - Name
+     - Description
+   * - start
+     - on_request_start
+   * - redirect
+     - on_request_redirect
+   * - acquire_connection
+     - Connection acquiring
+   * - headers_received
+     -
+   * - exception
+     - on_request_exception
+   * - end
+     - on_request_end
+   * - headers_sent
+     - on_request_headers_sent
+   * - chunk_sent
+     - on_request_chunk_sent
+   * - chunk_received
+     - on_response_chunk_received
 
 Connection acquiring
 ^^^^^^^^^^^^^^^^^^^^
 
-.. blockdiag::
-   :desctable:
+.. graphviz::
 
-   blockdiag {
-     orientation = portrait;
+   digraph {
 
-     begin[shape=beginpoint];
-     end[shape=endpoint];
-     exception[shape=flowchart.terminator, description="Exception raised"];
+     begin[shape=point, xlabel="begin", width="0.1"];
+     end[shape=point, xlabel="end ", width="0.1"];
+     exception[shape=oval];
 
-     queued_start[description="on_connection_queued_start"];
-     queued_end[description="on_connection_queued_end"];
-     create_start[description="on_connection_create_start"];
-     create_end[description="on_connection_create_end"];
-     reuseconn[description="on_connection_reuseconn"];
-
-     resolve_dns[description="DNS resolving"];
-     sock_connect[description="Connection establishment"];
+     queued_start[shape=box];
+     queued_end[shape=box];
+     create_start[shape=box];
+     create_end[shape=box];
+     reuseconn[shape=box];
+     resolve_dns[shape=box];
+     sock_connect[shape=box];
 
      begin -> reuseconn;
      begin -> create_start;
@@ -95,23 +112,47 @@ Connection acquiring
 
    }
 
+.. list-table::
+   :header-rows: 1
+
+   * - Name
+     - Description
+   * - begin
+     -
+   * - end
+     -
+   * - queued_start
+     - on_connection_queued_start
+   * - create_start
+     - on_connection_create_start
+   * - reuseconn
+     - on_connection_reuseconn
+   * - queued_end
+     - on_connection_queued_end
+   * - create_end
+     - on_connection_create_end
+   * - exception
+     - Exception raised
+   * - resolve_dns
+     - DNS resolving
+   * - sock_connect
+     - Connection establishment
+
 DNS resolving
 ^^^^^^^^^^^^^
 
-.. blockdiag::
-   :desctable:
+.. graphviz::
 
-   blockdiag {
-     orientation = portrait;
+   digraph {
 
-     begin[shape=beginpoint];
-     end[shape=endpoint];
-     exception[shape=flowchart.terminator, description="Exception raised"];
+     begin[shape=point, xlabel="begin", width="0.1"];
+     end[shape=point, xlabel="end", width="0.1"];
+     exception[shape=oval];
 
-     resolve_start[description="on_dns_resolvehost_start"];
-     resolve_end[description="on_dns_resolvehost_end"];
-     cache_hit[description="on_dns_cache_hit"];
-     cache_miss[description="on_dns_cache_miss"];
+     resolve_start[shape=box];
+     resolve_end[shape=box];
+     cache_hit[shape=box];
+     cache_miss[shape=box];
 
      begin -> cache_hit -> end;
      begin -> cache_miss -> resolve_start;
@@ -120,12 +161,31 @@ DNS resolving
 
    }
 
+.. list-table::
+   :header-rows: 1
 
-TraceConfig
------------
+   * - Name
+     - Description
+   * - begin
+     -
+   * - end
+     -
+   * - exception
+     - Exception raised
+   * - resolve_end
+     - on_dns_resolvehost_end
+   * - resolve_start
+     - on_dns_resolvehost_start
+   * - cache_hit
+     - on_dns_cache_hit
+   * - cache_miss
+     - on_dns_cache_miss
 
+Classes
+-------
 
 .. class:: TraceConfig(trace_config_ctx_factory=SimpleNamespace)
+   :canonical: aiohttp.tracing.TraceConfig
 
    Trace config is the configuration object used to trace requests
    launched by a :class:`ClientSession` object using different events
@@ -176,6 +236,15 @@ TraceConfig
       ``params`` is :class:`aiohttp.TraceResponseChunkReceivedParams` instance.
 
       .. versionadded:: 3.1
+
+      .. versionchanged:: 4.0
+
+         The signal now fires for every chunk returned from
+         ``ClientResponse.content``. Previously it only fired once from
+         :meth:`ClientResponse.read` with the full body, and direct
+         ``.content`` access did not fire it at all. For the synchronous
+         :meth:`StreamReader.read_nowait` the hook runs as a scheduled task,
+         not inline.
 
    .. attribute:: on_request_redirect
 
@@ -278,10 +347,9 @@ TraceConfig
 
       .. versionadded:: 3.8
 
-TraceRequestStartParams
------------------------
 
 .. class:: TraceRequestStartParams
+   :canonical: aiohttp.tracing.TraceRequestStartParams
 
    See :attr:`TraceConfig.on_request_start` for details.
 
@@ -298,10 +366,8 @@ TraceRequestStartParams
        Headers that will be used for the request, can be mutated.
 
 
-TraceRequestChunkSentParams
----------------------------
-
 .. class:: TraceRequestChunkSentParams
+   :canonical: aiohttp.tracing.TraceRequestChunkSentParams
 
    .. versionadded:: 3.1
 
@@ -320,10 +386,8 @@ TraceRequestChunkSentParams
        Bytes of chunk sent
 
 
-TraceResponseChunkReceivedParams
---------------------------------
-
 .. class:: TraceResponseChunkReceivedParams
+   :canonical: aiohttp.tracing.TraceResponseChunkReceivedParams
 
    .. versionadded:: 3.1
 
@@ -342,10 +406,8 @@ TraceResponseChunkReceivedParams
        Bytes of chunk received
 
 
-TraceRequestEndParams
----------------------
-
 .. class:: TraceRequestEndParams
+   :canonical: aiohttp.tracing.TraceRequestEndParams
 
    See :attr:`TraceConfig.on_request_end` for details.
 
@@ -366,10 +428,8 @@ TraceRequestEndParams
        Response :class:`ClientResponse`.
 
 
-TraceRequestExceptionParams
----------------------------
-
 .. class:: TraceRequestExceptionParams
+   :canonical: aiohttp.tracing.TraceRequestExceptionParams
 
    See :attr:`TraceConfig.on_request_exception` for details.
 
@@ -389,10 +449,9 @@ TraceRequestExceptionParams
 
        Exception raised during the request.
 
-TraceRequestRedirectParams
---------------------------
 
 .. class:: TraceRequestRedirectParams
+   :canonical: aiohttp.tracing.TraceRequestRedirectParams
 
    See :attr:`TraceConfig.on_request_redirect` for details.
 
@@ -412,55 +471,49 @@ TraceRequestRedirectParams
 
        Response :class:`ClientResponse` got from the redirect.
 
-TraceConnectionQueuedStartParams
---------------------------------
 
 .. class:: TraceConnectionQueuedStartParams
+   :canonical: aiohttp.tracing.TraceConnectionQueuedStartParams
 
    See :attr:`TraceConfig.on_connection_queued_start` for details.
 
    There are no attributes right now.
 
-TraceConnectionQueuedEndParams
-------------------------------
 
 .. class:: TraceConnectionQueuedEndParams
+   :canonical: aiohttp.tracing.TraceConnectionQueuedEndParams
 
    See :attr:`TraceConfig.on_connection_queued_end` for details.
 
    There are no attributes right now.
 
-TraceConnectionCreateStartParams
---------------------------------
 
 .. class:: TraceConnectionCreateStartParams
+   :canonical: aiohttp.tracing.TraceConnectionCreateStartParams
 
    See :attr:`TraceConfig.on_connection_create_start` for details.
 
    There are no attributes right now.
 
-TraceConnectionCreateEndParams
-------------------------------
 
 .. class:: TraceConnectionCreateEndParams
+   :canonical: aiohttp.tracing.TraceConnectionCreateEndParams
 
    See :attr:`TraceConfig.on_connection_create_end` for details.
 
    There are no attributes right now.
 
-TraceConnectionReuseconnParams
-------------------------------
 
 .. class:: TraceConnectionReuseconnParams
+   :canonical: aiohttp.tracing.TraceConnectionReuseconnParams
 
    See :attr:`TraceConfig.on_connection_reuseconn` for details.
 
    There are no attributes right now.
 
-TraceDnsResolveHostStartParams
-------------------------------
 
 .. class:: TraceDnsResolveHostStartParams
+   :canonical: aiohttp.tracing.TraceDnsResolveHostStartParams
 
    See :attr:`TraceConfig.on_dns_resolvehost_start` for details.
 
@@ -468,10 +521,9 @@ TraceDnsResolveHostStartParams
 
        Host that will be resolved.
 
-TraceDnsResolveHostEndParams
-----------------------------
 
 .. class:: TraceDnsResolveHostEndParams
+   :canonical: aiohttp.tracing.TraceDnsResolveHostEndParams
 
    See :attr:`TraceConfig.on_dns_resolvehost_end` for details.
 
@@ -479,10 +531,9 @@ TraceDnsResolveHostEndParams
 
        Host that has been resolved.
 
-TraceDnsCacheHitParams
-----------------------
 
 .. class:: TraceDnsCacheHitParams
+   :canonical: aiohttp.tracing.TraceDnsCacheHitParams
 
    See :attr:`TraceConfig.on_dns_cache_hit` for details.
 
@@ -490,10 +541,9 @@ TraceDnsCacheHitParams
 
        Host found in the cache.
 
-TraceDnsCacheMissParams
------------------------
 
 .. class:: TraceDnsCacheMissParams
+   :canonical: aiohttp.tracing.TraceDnsCacheMissParams
 
    See :attr:`TraceConfig.on_dns_cache_miss` for details.
 
@@ -501,10 +551,9 @@ TraceDnsCacheMissParams
 
        Host didn't find the cache.
 
-TraceRequestHeadersSentParams
------------------------------
 
 .. class:: TraceRequestHeadersSentParams
+   :canonical: aiohttp.tracing.TraceRequestHeadersSentParams
 
    See :attr:`TraceConfig.on_request_headers_sent` for details.
 

@@ -11,8 +11,9 @@ if has_ipv6:
     # support, but the target system still may not have it.
     # So let's ensure that we really have IPv6 support.
     try:
-        socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
-    except OSError:
+        with socket.socket(socket.AF_INET6, socket.SOCK_STREAM):
+            pass
+    except OSError:  # pragma: no cover
         has_ipv6 = False
 
 
